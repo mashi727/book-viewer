@@ -1,0 +1,22 @@
+[project]
+name = "book-viewer"
+version = "0.1.0"
+description = "自炊本PDFリーダー（見開き・右綴じ・表紙単独を PDF に書き込み、読書位置を記憶、更新を自動再読込）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pikepdf>=9",
+    "pyside6>=6.6",
+]
+
+[project.scripts]
+book-viewer = "book_viewer.app:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
