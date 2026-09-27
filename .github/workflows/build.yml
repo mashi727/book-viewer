@@ -50,14 +50,16 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           # --windowed の exe はコンソールを持たないので、終了を待って終了コードを見る
-          $p = Start-Process -FilePath "dist\Book Viewer\Book Viewer.exe" -Wait -PassThru
+          $p = Start-Process -FilePath "dist\Book Viewer.exe" -Wait -PassThru
           Get-Content $env:BOOK_VIEWER_SELFTEST
           exit $p.ExitCode
 
       - uses: actions/upload-artifact@v4
         with:
           name: book-viewer-${{ runner.os }}
-          path: dist/*.zip
+          path: |
+            dist/book-viewer-*.zip
+            dist/book-viewer-*.exe
           if-no-files-found: error
 
   release:
@@ -73,4 +75,4 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: artifacts/*

@@ -1,4 +1,4 @@
-"""配布用バイナリを作る（macOS: .app の zip、Windows: フォルダの zip）。
+"""配布用バイナリを作る（macOS: .app の zip、Windows: exe 1 つ）。
 
   uv run --group build python packaging/build.py
 
@@ -6,9 +6,10 @@
 PyInstaller はクロスコンパイルできないので、Windows 版は Windows 上（Actions）で作る。
 
   出力: dist/book-viewer-<版>-macos-<arch>.zip   … Book Viewer.app
-        dist/book-viewer-<版>-windows-x64.zip    … Book Viewer/Book Viewer.exe ほか
+        dist/book-viewer-<版>-windows-x64.exe    … exe 1 つ（--onefile）
 
-onefile（exe 1 つ）にしないのは、PySide6 が大きく、起動のたびに一時フォルダへ展開して遅くなるため。
+Windows を exe 1 つにするのは配布・持ち運びのため。起動のたびに中身を一時フォルダへ展開するので、
+フォルダ形式より起動が数秒遅い。macOS は .app がそもそも 1 つのまとまりなので onefile にしない。
 """
 from __future__ import annotations
 
@@ -43,6 +44,8 @@ def build() -> Path:
     ]
     if sys.platform == "darwin":
         args += ["--osx-bundle-identifier", "io.github.mashi727.book-viewer"]
+    elif sys.platform == "win32":
+        args += ["--onefile"]
     subprocess.run(args, check=True, cwd=ROOT)
     return ROOT / "dist"
 
@@ -56,8 +59,8 @@ def archive(dist: Path) -> Path:
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent",
                         str(dist / f"{APP_NAME}.app"), str(out)], check=True)
     elif sys.platform == "win32":
-        out = dist / f"book-viewer-{ver}-windows-x64.zip"
-        shutil.make_archive(str(out.with_suffix("")), "zip", dist, APP_NAME)
+        out = dist / f"book-viewer-{ver}-windows-x64.exe"
+        shutil.copyfile(dist / f"{APP_NAME}.exe", out)
     else:
         out = dist / f"book-viewer-{ver}-linux-{platform.machine()}.tar.gz"
         shutil.make_archive(str(out).removesuffix(".tar.gz"), "gztar", dist, APP_NAME)
@@ -68,7 +71,7 @@ def executable(dist: Path) -> Path:
     if sys.platform == "darwin":
         return dist / f"{APP_NAME}.app" / "Contents" / "MacOS" / APP_NAME
     if sys.platform == "win32":
-        return dist / APP_NAME / f"{APP_NAME}.exe"
+        return dist / f"{APP_NAME}.exe"
     return dist / APP_NAME / APP_NAME
 
 

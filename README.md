@@ -13,14 +13,14 @@ PySide6 + QtPdf（表示）+ pikepdf（開き方の書き込み）製。
 
 ## 配布用バイナリ（Windows / macOS）
 
-GitHub Actions（`.github/workflows/build.yml`）が Windows と macOS の zip を作る。
+GitHub Actions（`.github/workflows/build.yml`）が Windows の exe と macOS の zip を作る。
 
-- Actions タブの **build → Run workflow** … 実行結果の **Artifacts** に zip が置かれる
-- タグ `v*` を push … さらに GitHub Release が作られ、zip が添付される
+- Actions タブの **build → Run workflow** … 実行結果の **Artifacts** に置かれる
+- タグ `v*` を push … さらに GitHub Release が作られ、exe と zip が添付される
 
 | zip | 中身 | 起動 |
 |---|---|---|
-| `book-viewer-<版>-windows-x64.zip` | `Book Viewer` フォルダ | 展開して `Book Viewer.exe` |
+| `book-viewer-<版>-windows-x64.exe` | exe 1 つ | そのまま実行（起動のたびに中身を展開するので数秒かかる） |
 | `book-viewer-<版>-macos-arm64.zip` | `Book Viewer.app` | 展開してダブルクリック（Apple シリコン用） |
 
 どちらも署名していないので、初回は OS に止められる。
@@ -34,7 +34,7 @@ GitHub Actions（`.github/workflows/build.yml`）が Windows と macOS の zip �
 手元で作るときは同じスクリプトを使う（PyInstaller はクロスコンパイルできないので、その OS の上で作る）。
 
 ```bash
-uv run --group build python packaging/build.py     # dist/ に zip ができる
+uv run --group build python packaging/build.py     # dist/ に exe / zip ができる
 ```
 
 ## 導入・実行（uv）
