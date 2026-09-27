@@ -143,7 +143,13 @@ class _ThumbJob(QRunnable):
             painter.drawImage(0, 0, page)
             painter.end()
             _THUMB_DIR.mkdir(parents=True, exist_ok=True)
-            img.save(str(cache))
+            # 一時ファイルに書き終えてから名前を付け替える。直接書くと、書き込み中に
+            # ツールチップが書きかけの PNG を読み「libpng error: Read Error」になる
+            tmp = cache.with_name(f".{cache.stem}.{os.getpid()}.tmp.png")
+            if img.save(str(tmp)):
+                os.replace(tmp, cache)
+            else:
+                tmp.unlink(missing_ok=True)
             self._signals.done.emit(self._path)
         doc.close()
 
