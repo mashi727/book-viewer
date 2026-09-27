@@ -2,102 +2,49 @@
 
   book-viewer [フォルダ | PDF]
 
-左は本棚（現在フォルダの一覧。`..`、サブフォルダ、PDF をサムネイルと読書進捗つきで表示）。
-PDF をクリックで右に表示し、前回読んでいた位置から再開する。
+左は本棚（Windows エクスプローラー風のフォルダツリー。起動フォルダ・ホーム・この Mac の各ドライブ）。
+PDF をクリックで右に表示し、前回読んでいた位置から再開する。読書列は進捗、
+PDF にマウスを乗せると表紙のサムネイルが出る。
 
   開き方（PDF 本体に書き込める。⌘S）:
     B  … 右綴じ / 左綴じ      D … 見開き / 単ページ      C … 表紙を単独にする
   読書:
     → ← Space ホイール クリック … ページ送り（詳細は spread_view.py）
-    F / Esc … 全画面 / 解除      ⌘O … フォルダを開く      ⌘↑ … 親フォルダへ
+    F / Esc … 全画面 / 解除      ⌘O … フォルダをツリーで開く
+    フォルダをクリック … 開閉      ⌘↑ … 親フォルダを選択して閉じる
   自動再読込:
     表示中の PDF が書き換えられたら（TeX の再コンパイル等）、書き込みが落ち着くのを
     待って読み込み直す。ページ位置と、ビューア上の開き方は保つ。
 """
 from __future__ import annotations
 
-import hashlib
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import (
-    QFileSystemWatcher,
-    QObject,
-    QRunnable,
-    QSize,
-    Qt,
-    QThreadPool,
-    QTimer,
-    Signal,
-)
-from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtCore import QFileSystemWatcher, Qt, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QSizePolicy,
     QSplitter,
     QStatusBar,
-    QStyle,
     QToolBar,
     QWidget,
 )
 
 from . import pdfprefs
+from .file_browser import FileBrowserPanel
 from .layout import Layout
 from .spread_view import SpreadView
 from .state import Store, state_dir
 
-_THUMB = QSize(48, 64)
-_THUMB_DIR = Path.home() / ".cache" / "book-viewer" / "thumbs"
 _RELOAD_SETTLE_MS = 400      # 書き込みが止んだと見なすまでの待ち
 _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ諦める
-
-
-# ---- サムネイル（別スレッドでレンダリングし、ディスクにキャッシュ） ----
-
-class _ThumbSignals(QObject):
-    done = Signal(str, QImage)
-
-
-class _ThumbJob(QRunnable):
-    def __init__(self, path: str, signals: _ThumbSignals):
-        super().__init__()
-        self._path = path
-        self._signals = signals
-
-    def run(self) -> None:
-        img = QImage()
-        try:
-            st = Path(self._path).stat()
-            key = hashlib.sha1(f"{self._path}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
-            cache = _THUMB_DIR / f"{key}.png"
-            if cache.exists():
-                img.load(str(cache))
-            if img.isNull():
-                doc = QPdfDocument()
-                if doc.load(self._path) == QPdfDocument.Error.None_ and doc.pageCount() > 0:
-                    s = doc.pagePointSize(0)
-                    h = _THUMB.height() * 2
-                    w = max(1, round(h * s.width() / s.height())) if s.height() > 0 else h
-                    page = doc.render(0, QSize(w, h))
-                    # 透明な背景（TeX の出力など）に紙の白を敷く
-                    img = QImage(page.size(), QImage.Format.Format_RGB32)
-                    img.fill(Qt.GlobalColor.white)
-                    painter = QPainter(img)
-                    painter.drawImage(0, 0, page)
-                    painter.end()
-                    _THUMB_DIR.mkdir(parents=True, exist_ok=True)
-                    img.save(str(cache))
-                doc.close()
-        except OSError:
-            pass
-        self._signals.done.emit(self._path, img)
 
 
 class BookViewer(QMainWindow):
@@ -109,15 +56,11 @@ class BookViewer(QMainWindow):
         self._root = str(Path(directory).resolve())
         self._book: str | None = None
         self._saved_layout = Layout()       # PDF に書かれている開き方
-        self._items: dict[str, QListWidgetItem] = {}
-        self._thumbs: dict[str, QIcon] = {}
 
-        # 左: 本棚
-        self._list = QListWidget()
-        self._list.setIconSize(_THUMB)
-        self._list.setSpacing(1)
-        self._list.itemClicked.connect(self._on_item_clicked)
-        self._list.itemDoubleClicked.connect(self._on_item_double)
+        # 左: 本棚（フォルダツリー）
+        self._browser = FileBrowserPanel(Path(self._root), self._store.position)
+        self._browser.pdf_clicked.connect(lambda p: self._open_book(str(p)))
+        self._browser.reveal(self._root)
 
         # 右: 見開きビュー
         self._doc = QPdfDocument(self)
@@ -125,11 +68,11 @@ class BookViewer(QMainWindow):
         self._view.pageChanged.connect(self._on_page_changed)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
-        self._splitter.addWidget(self._list)
+        self._splitter.addWidget(self._browser)
         self._splitter.addWidget(self._view)
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([320, 1080])
+        self._splitter.setSizes([420, 980])
         self.setCentralWidget(self._splitter)
         self.setStatusBar(QStatusBar())
 
@@ -140,14 +83,6 @@ class BookViewer(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(
             lambda: self._set_fullscreen(False)
         )
-
-        # フォルダ監視（本棚の自動更新）
-        self._dir_watcher = QFileSystemWatcher(self)
-        self._refresh_timer = QTimer(self)
-        self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.setInterval(200)
-        self._refresh_timer.timeout.connect(self._populate)
-        self._dir_watcher.directoryChanged.connect(lambda _p: self._refresh_timer.start())
 
         # 表示中 PDF の監視（自動再読込）
         self._file_watcher = QFileSystemWatcher(self)
@@ -166,18 +101,9 @@ class BookViewer(QMainWindow):
         self._save_timer.setInterval(1000)
         self._save_timer.timeout.connect(self._save_position)
 
-        # サムネイル生成は 1 スレッドに絞る（pdfium は内部でグローバルロックを取る）
-        self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(1)
-        self._thumb_signals = _ThumbSignals()
-        self._thumb_signals.done.connect(self._on_thumb)
-
-        self._set_root(self._root)
         if open_pdf:
             self._open_book(open_pdf)
-            item = self._items.get(open_pdf)
-            if item:
-                self._list.setCurrentItem(item)
+            self._browser.reveal(open_pdf)
 
     # ---- ツールバー ----
 
@@ -262,7 +188,7 @@ class BookViewer(QMainWindow):
         if on == self.isFullScreen():
             return
         self._act_full.setChecked(on)
-        self._list.setVisible(not on)
+        self._browser.setVisible(not on)
         self.statusBar().setVisible(not on)
         self._toolbar.setVisible(not on)
         if on:
@@ -273,97 +199,14 @@ class BookViewer(QMainWindow):
 
     # ---- 本棚 ----
 
-    def _set_root(self, path: str) -> None:
-        path = str(Path(path).resolve())
-        if not Path(path).is_dir():
-            return
-        self._root = path
-        self._store.last_dir = path
-        self._store.save()
-        old = self._dir_watcher.directories()
-        if old:
-            self._dir_watcher.removePaths(old)
-        self._dir_watcher.addPath(path)
-        if not self._book:
-            self.setWindowTitle(f"{Path(path).name} — Book Viewer")
-        self._populate()
-
-    def _progress_text(self, pdf: str) -> str:
-        pos = self._store.position(pdf)
-        if not pos:
-            return "未読"
-        page, pages = pos
-        pct = round(100 * (page + 1) / pages) if pages else 0
-        return f"{pct}%  ({page + 1}/{pages})"
-
-    def _populate(self) -> None:
-        cur = self._list.currentItem()
-        selected = cur.data(Qt.ItemDataRole.UserRole) if cur else None
-        self._list.clear()
-        self._items.clear()
-        style = self.style()
-        path = self._root
-        parent = str(Path(path).parent)
-        if parent != path:
-            up = QListWidgetItem(style.standardIcon(QStyle.StandardPixmap.SP_FileDialogToParent), "..")
-            up.setData(Qt.ItemDataRole.UserRole, parent)
-            self._list.addItem(up)
-        try:
-            entries = list(Path(path).iterdir())
-        except OSError:
-            entries = []
-        dirs = sorted((p for p in entries if p.is_dir() and not p.name.startswith(".")),
-                      key=lambda p: p.name.lower())
-        pdfs = sorted((p for p in entries if p.is_file() and p.suffix.lower() == ".pdf"
-                       and not p.name.startswith(".")), key=lambda p: p.name.lower())
-        for p in dirs:
-            it = QListWidgetItem(style.standardIcon(QStyle.StandardPixmap.SP_DirIcon), p.name)
-            it.setData(Qt.ItemDataRole.UserRole, str(p))
-            self._list.addItem(it)
-        placeholder = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
-        for p in pdfs:
-            sp = str(p)
-            it = QListWidgetItem(self._thumbs.get(sp, placeholder), f"{p.stem}\n{self._progress_text(sp)}")
-            it.setData(Qt.ItemDataRole.UserRole, sp)
-            it.setToolTip(p.name)
-            self._list.addItem(it)
-            self._items[sp] = it
-            if sp not in self._thumbs:
-                self._pool.start(_ThumbJob(sp, self._thumb_signals))
-        if selected:
-            for i in range(self._list.count()):
-                if self._list.item(i).data(Qt.ItemDataRole.UserRole) == selected:
-                    self._list.setCurrentRow(i)
-                    break
-
-    def _on_thumb(self, path: str, img: QImage) -> None:
-        if img.isNull():
-            return
-        icon = QIcon(QPixmap.fromImage(img))
-        self._thumbs[path] = icon
-        item = self._items.get(path)
-        if item:
-            item.setIcon(icon)
-
     def _go_up(self) -> None:
-        parent = str(Path(self._root).parent)
-        if parent != self._root:
-            self._set_root(parent)
+        self._browser.select_parent()
 
     def _open_folder(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "フォルダを開く", self._root)
         if chosen:
-            self._set_root(chosen)
-
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if path and path.lower().endswith(".pdf") and Path(path).is_file():
-            self._open_book(path)
-
-    def _on_item_double(self, item: QListWidgetItem) -> None:
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if path and Path(path).is_dir():
-            self._set_root(path)
+            self._root = chosen
+            self._browser.reveal(chosen)
 
     # ---- 本を開く ----
 
@@ -386,6 +229,7 @@ class BookViewer(QMainWindow):
             self._file_watcher.removePath(self._book)
         self._book = path
         self._saved_layout = layout
+        self._store.last_dir = str(Path(path).parent)
         self._sync_actions(layout)
         self._view.set_layout(layout)
         pos = self._store.position(path)
@@ -412,9 +256,7 @@ class BookViewer(QMainWindow):
             return
         self._store.set_position(self._book, self._view.current_page(), self._view.page_count())
         self._store.save()
-        item = self._items.get(self._book)
-        if item:
-            item.setText(f"{Path(self._book).stem}\n{self._progress_text(self._book)}")
+        self._browser.refresh_progress(self._book)
 
     # ---- 自動再読込 ----
 
@@ -495,8 +337,7 @@ class BookViewer(QMainWindow):
         old.deleteLater()
         self._loaded_sig = sig
         self._update_action_state()
-        self._thumbs.pop(path, None)
-        self._refresh_timer.start()
+        self._browser.forget_thumbnail(path)
         self.statusBar().showMessage(f"再読み込みしました（{doc.pageCount()} ページ）", 3000)
 
     def closeEvent(self, event) -> None:
