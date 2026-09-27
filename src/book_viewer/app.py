@@ -369,14 +369,40 @@ class BookViewer(QMainWindow):
         if layout == self._saved_layout:
             return
         try:
-            pdfprefs.write_layout(self._book, layout, log_path=state_dir() / "prefs-log.jsonl")
+            self._write_layout(layout)
         except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
             QMessageBox.warning(self, "PDF に保存できませんでした", f"{Path(self._book).name}\n\n{e}")
             return
+        self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
+
+    def _write_layout(self, layout: Layout) -> None:
+        """開き方を PDF に書き込み、表示に反映する。
+
+        Windows では開いているファイルを置き換えられない（os.replace が WinError 5）。
+        ページビューとサムネイルのスレッドが PDF を開いたままなので、書き込みの間だけ
+        両方を閉じ、終わったら（失敗しても）開き直す。書き込みは同期処理で、その間に
+        再描画は走らないので画面はちらつかない。
+        """
+        path = self._book
+        if not path:
+            return
+        page = self._view.current_page()
+        self._thumbs.release_file()
+        self._doc.close()
+        try:
+            pdfprefs.write_layout(path, layout, log_path=state_dir() / "prefs-log.jsonl")
+        finally:
+            doc = QPdfDocument(self)
+            doc.load(path)
+            old, self._doc = self._doc, doc
+            self._thumbs.set_document(path, doc.pageCount())
+            self._view.set_document(doc, page)
+            old.deleteLater()
+            self._loaded_sig = self._file_sig(path)     # 自分の書き込みで再読込が走らないように
+            if path not in self._file_watcher.files():
+                self._file_watcher.addPath(path)
         self._saved_layout = layout
         self._apply_layout(layout)
-        self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
-        # 置き換えたファイルは直後に fileChanged が来て再読込される
 
     # ---- ズーム ----
 

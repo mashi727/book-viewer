@@ -3,7 +3,7 @@
 画面の無い CI（GitHub Actions の Windows / macOS）で、固めたバイナリが
   1. 起動してウィンドウを組み立てられるか（PySide6 / QtPdf が同梱されているか）
   2. PDF を開いて描けるか
-  3. 開き方を PDF に書き込めるか（pikepdf が同梱されているか）
+  3. 表示したまま開き方を PDF に書き込めるか（pikepdf の同梱、Windows のファイルロック）
   4. 縦書き判定が動くか
 を確かめる。結果は終了コード（0 = 成功）と、指定したファイルへの 1 行で返す
 （--windowed のバイナリは標準出力を持たないので、ファイルに書く）。
@@ -52,9 +52,11 @@ def run(result_path: str) -> int:
         direction.detect(win._doc)
         steps.append("direction detect")
 
-        pdfprefs.write_layout(pdf_path, Layout(spread=True, cover_single=True, rtl=True))
+        # アプリと同じ経路（表示中の PDF を閉じて書き込み、開き直す）で書き込む
+        win._write_layout(Layout(spread=True, cover_single=True, rtl=True))
         assert pdfprefs.read_layout(pdf_path).rtl
-        steps.append("layout written")
+        assert win._view.page_count() == 3, "reopen failed"
+        steps.append("layout written while open")
 
         win.close()
         Path(result_path).write_text("OK " + " / ".join(steps) + "\n", encoding="utf-8")

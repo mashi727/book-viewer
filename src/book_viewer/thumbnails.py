@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QAbstractListModel,
     QItemSelection,
     QItemSelectionModel,
+    QMetaObject,
     QModelIndex,
     QObject,
     QSize,
@@ -51,6 +52,14 @@ class _RenderWorker(QObject):
         self.latest = 0                      # 最新の世代（メインスレッドが書き換える）
         self._doc: QPdfDocument | None = None
         self._path: str | None = None
+
+    @Slot()
+    def release(self) -> None:
+        """開いている PDF を閉じる（Windows で PDF を書き換える前に呼ぶ）。"""
+        if self._doc is not None:
+            self._doc.close()
+        self._doc = None
+        self._path = None
 
     @Slot(int, str, int, int, int)
     def render(self, gen: int, path: str, page: int, w: int, h: int) -> None:
@@ -215,6 +224,10 @@ class ThumbnailPane(QWidget):
             idx = self.model.index(pages[0])
             if idx.isValid():
                 self.view.scrollTo(idx, QAbstractItemView.ScrollHint.EnsureVisible)
+
+    def release_file(self) -> None:
+        """描画スレッドが開いている PDF を閉じる。スレッド側で閉じ終わるまで待つ。"""
+        QMetaObject.invokeMethod(self._worker, "release", Qt.ConnectionType.BlockingQueuedConnection)
 
     def shutdown(self) -> None:
         self._thread.quit()
