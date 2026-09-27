@@ -12,6 +12,7 @@
     ページ表示 …… 単一ページ表示 / 見開きページ表示 / 見開きページ表示で表紙を表示
     表示切り替え … F4 ページサムネール、フォルダツリー
   ツールバーの「見開きページ表示 ▾」… 本体で見開きに切替、▾ で表紙あり / なしを選ぶ
+    ズーム ……… ⌘+ / ⌘- ズームイン / アウト、⌘0 ページレベルにズーム、⌘1 実際のサイズ、⌘2 幅に合わせる
     ⌘L 全画面モード（Esc で解除）
   読書:
     → ← Space ホイール クリック … ページ送り（詳細は spread_view.py）
@@ -36,6 +37,7 @@ from PySide6.QtGui import QAction, QActionGroup, QFont, QIntValidator, QKeySeque
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QInputDialog,
@@ -92,6 +94,7 @@ class BookViewer(QMainWindow):
         self._doc = QPdfDocument(self)
         self._view = SpreadView()
         self._view.pageChanged.connect(self._on_page_changed)
+        self._view.zoomChanged.connect(self._on_zoom_changed)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self._browser)
@@ -134,6 +137,7 @@ class BookViewer(QMainWindow):
         self._apply_default_size()
         self._set_tree_visible(self._store.ui("show_tree", True))
         self._set_thumbs_visible(self._store.ui("show_thumbnails", True))
+        self._view.set_zoom(self._store.ui("zoom_mode", "page"), self._store.ui("zoom_percent", 100.0))
         self._on_page_changed(0)
 
         if open_pdf:
@@ -219,6 +223,14 @@ class BookViewer(QMainWindow):
         self._act_tree = A("フォルダツリー", None, self._set_tree_visible, checkable=True,
                            tip="フォルダツリーを表示 / 非表示")
         self._act_full = A("全画面モード", "Ctrl+L", self._set_fullscreen, checkable=True)
+        # ズーム（Acrobat と同じキー）
+        self._act_zoom_in = A("ズームイン", QKeySequence.StandardKey.ZoomIn, self._view.zoom_in)
+        self._act_zoom_out = A("ズームアウト", QKeySequence.StandardKey.ZoomOut, self._view.zoom_out)
+        self._act_zoom_page = A("ページレベルにズーム", "Ctrl+0", lambda: self._set_zoom("page"))
+        self._act_zoom_actual = A("実際のサイズ", "Ctrl+1", lambda: self._set_zoom("actual"))
+        self._act_zoom_width = A("幅に合わせる", "Ctrl+2", lambda: self._set_zoom("width"))
+        self._act_zoom_in.setIconText("+")
+        self._act_zoom_out.setIconText("−")
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -238,6 +250,10 @@ class BookViewer(QMainWindow):
         disp.addActions([self._act_single, self._act_spread])
         disp.addSeparator()
         disp.addAction(self._act_cover)
+        zoom = m.addMenu("ズーム")
+        zoom.addActions([self._act_zoom_in, self._act_zoom_out])
+        zoom.addSeparator()
+        zoom.addActions([self._act_zoom_page, self._act_zoom_actual, self._act_zoom_width])
         toggle = m.addMenu("表示切り替え")
         panes = toggle.addMenu("ナビゲーションパネル")
         panes.addAction(self._act_thumbs)
@@ -269,6 +285,22 @@ class BookViewer(QMainWindow):
         self._page_total.setContentsMargins(4, 0, 8, 0)
         tb.addWidget(self._page_total)
         tb.addSeparator()
+        tb.addAction(self._act_zoom_out)
+        self._zoom_box = QComboBox()
+        self._zoom_box.setEditable(True)
+        self._zoom_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._zoom_box.setMinimumContentsLength(6)
+        self._zoom_box.setToolTip("倍率（数字を入れて Enter）")
+        for label, data in (("ページレベルにズーム", "page"), ("幅に合わせる", "width"), ("実際のサイズ", "actual")):
+            self._zoom_box.addItem(label, data)
+        self._zoom_box.insertSeparator(3)
+        for z in (50, 75, 100, 125, 150, 200, 300, 400):
+            self._zoom_box.addItem(f"{z}%", float(z))
+        self._zoom_box.activated.connect(self._on_zoom_box_activated)
+        self._zoom_box.lineEdit().returnPressed.connect(self._on_zoom_box_entered)
+        tb.addWidget(self._zoom_box)
+        tb.addAction(self._act_zoom_in)
+        tb.addSeparator()
         tb.addAction(self._act_single)
         spread_btn = QToolButton()
         spread_btn.setDefaultAction(self._act_spread)
@@ -283,8 +315,9 @@ class BookViewer(QMainWindow):
 
         # ボタンはアクション追加時に作られるので、最後にまとめて文字を大きくする
         font = QApplication.font()
-        for w in (tb, self._page_box, self._page_total, *tb.findChildren(QToolButton)):
+        for w in (tb, self._page_box, self._page_total, self._zoom_box, *tb.findChildren(QToolButton)):
             w.setFont(font)
+        self._zoom_box.view().setFont(font)
 
     # ---- 開き方（表示）と文書のプロパティ ----
 
@@ -341,6 +374,40 @@ class BookViewer(QMainWindow):
         self._apply_layout(layout)
         self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
         # 置き換えたファイルは直後に fileChanged が来て再読込される
+
+    # ---- ズーム ----
+
+    def _set_zoom(self, mode: str, percent: float | None = None) -> None:
+        self._view.set_zoom(mode, percent)
+        self._store.set_ui("zoom_mode", mode)
+        if mode == "custom":
+            self._store.set_ui("zoom_percent", self._view.zoom_percent())
+        self._store.save()
+
+    def _on_zoom_changed(self, percent: float) -> None:
+        # ズームイン / アウト・ピンチ・⌘ホイールで変わった倍率も記録する
+        if self._view.zoom_mode() == "custom":
+            self._store.set_ui("zoom_mode", "custom")
+            self._store.set_ui("zoom_percent", percent)
+        self._zoom_box.setEditText(f"{percent:.0f}%")
+
+    def _on_zoom_box_activated(self, index: int) -> None:
+        data = self._zoom_box.itemData(index)
+        if isinstance(data, str):
+            self._set_zoom(data)
+        elif isinstance(data, float):
+            self._set_zoom("custom", data)
+        self._zoom_box.setEditText(f"{self._view.zoom_percent():.0f}%")
+        self._view.setFocus()
+
+    def _on_zoom_box_entered(self) -> None:
+        text = self._zoom_box.currentText().strip().rstrip("%").strip()
+        try:
+            self._set_zoom("custom", float(text))
+        except ValueError:
+            pass
+        self._zoom_box.setEditText(f"{self._view.zoom_percent():.0f}%")
+        self._view.setFocus()
 
     # ---- 表示切り替え ----
 
@@ -577,6 +644,7 @@ class BookViewer(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_position()
+        self._store.save()                      # ズームの倍率など
         self._thumbs.shutdown()
         super().closeEvent(event)
 
