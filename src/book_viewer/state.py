@@ -3,18 +3,31 @@
 PDF 本体は読むたびに書き換えたくないので、読書位置はこちらに持つ。
 キーは PDF の絶対パス（ファイル名を変えると位置は引き継がれない）。
 
-  既定の置き場: $XDG_STATE_HOME/book-viewer/  （未設定なら ~/.local/state/book-viewer/）
+  既定の置き場:
+    macOS / Linux: $XDG_STATE_HOME/book-viewer/  （未設定なら ~/.local/state/book-viewer/）
+    Windows:       %LOCALAPPDATA%/book-viewer/
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 
 def state_dir() -> Path:
-    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    return Path(base) / "book-viewer"
+    if os.environ.get("XDG_STATE_HOME"):
+        return Path(os.environ["XDG_STATE_HOME"]) / "book-viewer"
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "book-viewer"
+    return Path.home() / ".local" / "state" / "book-viewer"
+
+
+def cache_dir() -> Path:
+    """消えても作り直せるもの（サムネイル）の置き場。"""
+    if sys.platform == "win32":
+        return state_dir() / "cache"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "book-viewer"
 
 
 class Store:

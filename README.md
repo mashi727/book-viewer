@@ -11,6 +11,32 @@
 
 PySide6 + QtPdf（表示）+ pikepdf（開き方の書き込み）製。
 
+## 配布用バイナリ（Windows / macOS）
+
+GitHub Actions（`.github/workflows/build.yml`）が Windows と macOS の zip を作る。
+
+- Actions タブの **build → Run workflow** … 実行結果の **Artifacts** に zip が置かれる
+- タグ `v*` を push … さらに GitHub Release が作られ、zip が添付される
+
+| zip | 中身 | 起動 |
+|---|---|---|
+| `book-viewer-<版>-windows-x64.zip` | `Book Viewer` フォルダ | 展開して `Book Viewer.exe` |
+| `book-viewer-<版>-macos-arm64.zip` | `Book Viewer.app` | 展開してダブルクリック（Apple シリコン用） |
+
+どちらも署名していないので、初回は OS に止められる。
+
+- Windows: SmartScreen の「Windows によって PC が保護されました」→「詳細情報」→「実行」
+- macOS: 「開発元を検証できない」→ Finder で右クリック →「開く」、または
+  `xattr -dr com.apple.quarantine "Book Viewer.app"`
+
+ビルドのたびに、固めたバイナリを画面なしで起動して PDF を開く・描く・開き方を書き込むまでを確かめている
+（`BOOK_VIEWER_SELFTEST=<結果ファイル>` で起動する自己診断。`src/book_viewer/selftest.py`）。
+手元で作るときは同じスクリプトを使う（PyInstaller はクロスコンパイルできないので、その OS の上で作る）。
+
+```bash
+uv run --group build python packaging/build.py     # dist/ に zip ができる
+```
+
 ## 導入・実行（uv）
 
 ```bash

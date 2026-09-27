@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -62,7 +63,9 @@ from .state import Store, state_dir
 from .thumbnails import ThumbnailPane
 
 _DEFAULT_SIZE = QSize(1920, 1080)   # 既定のウィンドウサイズ（FHD）。画面が小さければ収まる大きさに縮める
-_UI_PT = 16                  # アプリ内の文字はすべてこの大きさ（macOS の既定は 13pt、ツールバー 10pt、ツールチップ 11pt）
+# アプリ内の文字はすべてこの大きさ（macOS の既定は 13pt、ツールバー 10pt、ツールチップ 11pt）。
+# macOS は 1pt = 1 論理 px、Windows は 1pt = 96/72 px なので、Windows の 12pt が macOS の 16pt と同じ 16px になる
+_UI_PT = 12 if sys.platform == "win32" else 16
 _RELOAD_SETTLE_MS = 400      # 書き込みが止んだと見なすまでの待ち
 _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ諦める
 
@@ -650,6 +653,11 @@ class BookViewer(QMainWindow):
 
 
 def main() -> int:
+    # 配布用バイナリの自己診断（CI 用。packaging/build.py と .github/workflows/build.yml を参照）
+    selftest_result = os.environ.get("BOOK_VIEWER_SELFTEST")
+    if selftest_result:
+        from .selftest import run
+        return run(selftest_result)
     app = QApplication(sys.argv)
     app.setApplicationName("book-viewer")
     positional = [a for a in app.arguments()[1:] if not a.startswith("-")]

@@ -3,8 +3,8 @@
   ..                 （起動フォルダを 1 つ上へ付け替える）
   📁 <起動フォルダ>
   🏠 ホーム
-  💻 この Mac
-      Macintosh HD / 外付けドライブ / ネットワークドライブ（/Volumes）
+  💻 この Mac（Windows では「PC」）
+      Macintosh HD / 外付けドライブ / ネットワークドライブ（/Volumes。Windows では C: などのドライブ）
 
 最上位が複数あるので QFileSystemModel（根は 1 つ）ではなく QTreeWidget で組み、
 フォルダは展開された時点で中身を読む（遅延読み込み）。アイコンは
@@ -56,8 +56,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .state import cache_dir
+
 _THUMB_HEIGHT = 240          # ツールチップのサムネイル高さ (px)
-_THUMB_DIR = Path.home() / ".cache" / "book-viewer" / "thumbs"
+_THUMB_DIR = cache_dir() / "thumbs"
+_COMPUTER_LABEL = "PC" if sys.platform == "win32" else "この Mac"
 _PATH_ROLE = Qt.ItemDataRole.UserRole          # 項目のパス（str）。「この Mac」は None
 _LOADED_ROLE = Qt.ItemDataRole.UserRole + 1    # フォルダの中身を読み込み済みか
 _PLACEHOLDER = "…"                             # 未読込フォルダに ▸ を出すための仮の子
@@ -65,6 +68,17 @@ _PLACEHOLDER = "…"                             # 未読込フォルダに ▸ 
 # macOS keeps system snapshots / helper volumes under /Volumes as well.
 _HIDDEN_VOLUME_NAMES = {"Recovery", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware"}
 _NETWORK_FS = {"smbfs", "afpfs", "nfs", "webdav", "cifs", "smb3", "fuse.sshfs"}
+
+
+def is_hidden(st: os.stat_result) -> bool:
+    """Finder / エクスプローラーと同じく隠しファイルか（名前の . 始まりは呼び出し側で見る）。
+
+    macOS は UF_HIDDEN フラグ（/bin・/usr・~/Library など）、Windows は隠し属性。
+    どちらの属性も、無い OS の stat_result には存在しない。
+    """
+    if getattr(st, "st_flags", 0) & stat.UF_HIDDEN:
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_HIDDEN)
 
 
 def mounted_volumes() -> list[tuple[str, Path]]:
@@ -304,7 +318,7 @@ class FileBrowserPanel(QWidget):
         self._up_item = up
         start = self._start_item = self._make_start_item()
         home = self._dir_item(Path.home(), "ホーム")
-        mac = QTreeWidgetItem(["この Mac", ""])
+        mac = QTreeWidgetItem([_COMPUTER_LABEL, ""])
         mac.setIcon(0, self._icons.icon(QFileIconProvider.IconType.Computer))
         mac.setData(0, _PATH_ROLE, None)
         self._mac = mac
@@ -396,8 +410,8 @@ class FileBrowserPanel(QWidget):
                     if e.name.startswith("."):
                         continue
                     try:
-                        # Finder と同じく UF_HIDDEN 付き（/bin・/usr・~/Library 等）も隠す
-                        if e.stat(follow_symlinks=False).st_flags & stat.UF_HIDDEN:
+                        # Finder / エクスプローラーと同じく隠し属性のもの（/bin・/usr・~/Library 等）も隠す
+                        if is_hidden(e.stat(follow_symlinks=False)):
                             continue
                         if e.is_dir():
                             dirs.append(Path(e.path))
