@@ -1,8 +1,10 @@
 [project]
 name = "book-viewer"
-version = "0.2.0"
+version = "0.3.0"
 description = "自炊本PDFリーダー（見開き・右綴じ・表紙単独を PDF に書き込み、読書位置を記憶、更新を自動再読込）"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "pikepdf>=9",

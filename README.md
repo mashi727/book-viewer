@@ -6,6 +6,7 @@
 [![release](https://img.shields.io/github/v/release/mashi727/book-viewer)](https://github.com/mashi727/book-viewer/releases/latest)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)
 ![python](https://img.shields.io/badge/python-3.12-blue)
+![license](https://img.shields.io/github/license/mashi727/book-viewer)
 
 ![Book Viewer の画面。左からフォルダツリー、ページサムネール、縦書きの本の見開き（右綴じ）](docs/images/main.png)
 
@@ -189,3 +190,7 @@ uv run --group build python packaging/build.py     # 配布用バイナリ（そ
 （PDF を開く・描く・開き方を書き込む・空白ページを挿入する）を通してから Release に添付します。
 
 PySide6（Qt / QtPdf）と pikepdf で作っています。
+
+## ライセンス
+
+[MIT License](LICENSE)
