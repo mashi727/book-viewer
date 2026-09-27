@@ -56,7 +56,7 @@ def run(result_path: str) -> int:
         win._write_layout(Layout(spread=True, cover_single=True, rtl=True))
         assert pdfprefs.read_layout(pdf_path).rtl
         assert win._view.page_count() == 3, "reopen failed"
-        steps.append("layout written while open")
+        steps.append(f"layout written while open [{pdfprefs.last_replace_method}]")
 
         win.close()
         Path(result_path).write_text("OK " + " / ".join(steps) + "\n", encoding="utf-8")

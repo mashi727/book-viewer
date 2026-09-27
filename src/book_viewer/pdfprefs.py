@@ -16,12 +16,53 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pikepdf
 
 from .layout import Layout
+
+# 直近の書き込みで元ファイルをどう差し替えたか（"replace" / "replace-retry" / "copy"）。自己診断で記録する
+last_replace_method = ""
+
+
+class TmpKeptError(PermissionError):
+    """差し替えに失敗し、正しい内容の一時ファイルを残した。"""
+
+
+def _replace(tmp: Path, path: Path) -> None:
+    """検証済みの一時ファイルで元ファイルを差し替える。
+
+    通常は os.replace（アトミック）。Windows では開いているファイルを置き換えられず
+    PermissionError（WinError 5）になる。ウイルス対策ソフトの走査などの一時的なものは
+    待てば通るので少し再試行し、それでも駄目なら中身を上書きコピーする（書き込み共有を
+    許して開いている相手がいても通る）。コピーの途中で失敗したら一時ファイルを残して知らせる。
+    """
+    global last_replace_method
+    tries = 15 if sys.platform == "win32" else 1
+    for i in range(tries):
+        try:
+            os.replace(tmp, path)
+            last_replace_method = "replace" if i == 0 else f"replace-retry({i})"
+            return
+        except PermissionError:
+            if i == tries - 1:
+                break
+            time.sleep(0.2)
+    if sys.platform != "win32":
+        raise PermissionError(f"置き換えられませんでした: {path}")
+    try:
+        shutil.copyfile(tmp, path)
+    except OSError as e:
+        raise TmpKeptError(
+            f"PDF を書き換えられませんでした（他のアプリが開いている可能性があります）。"
+            f"書き込むはずだった内容は {tmp} に残しています: {e}") from e
+    last_replace_method = "copy"
+    tmp.unlink(missing_ok=True)
 
 _SPREAD_COVER = {"/TwoPageRight", "/TwoColumnRight"}
 _SPREAD_NO_COVER = {"/TwoPageLeft", "/TwoColumnLeft"}
@@ -70,6 +111,7 @@ def write_layout(path: str | os.PathLike, layout: Layout, log_path: Path | None 
         else "/SinglePage"
     )
     direction = "/R2L" if layout.rtl else "/L2R"
+    keep_tmp = False
     try:
         with pikepdf.open(path) as pdf:
             old = _raw(pdf)
@@ -94,6 +136,10 @@ def write_layout(path: str | os.PathLike, layout: Layout, log_path: Path | None 
                     "old": old,
                     "new": {"PageLayout": page_layout, "Direction": direction},
                 }, ensure_ascii=False) + "\n")
-        os.replace(tmp, path)
+        _replace(tmp, path)
+    except TmpKeptError:
+        keep_tmp = True                 # 中身は正しいので残す（エラーに場所を書いてある）
+        raise
     finally:
-        tmp.unlink(missing_ok=True)
+        if not keep_tmp:
+            tmp.unlink(missing_ok=True)

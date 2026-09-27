@@ -58,3 +58,12 @@ def test_direction_is_set(tmp_path):
     assert direction_is_set(p) is False
     write_layout(p, Layout(False, True, False))
     assert direction_is_set(p) is True
+
+
+def test_temp_file_removed_on_failure(tmp_path):
+    import pytest
+    p = tmp_path / "broken.pdf"
+    p.write_bytes(b"not a pdf")
+    with pytest.raises(Exception):
+        write_layout(p, Layout(True, True, True))
+    assert not list(tmp_path.glob(".*tmp"))
