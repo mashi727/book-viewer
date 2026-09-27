@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -29,6 +30,21 @@ _PAGE_LAYOUTS = [
 ]
 
 
+_TEXT_WIDTH = 360        # ファイル名・場所の表示幅 (px)。これを超える分は中ほどを「…」で省略する
+
+
+def _elided_label(text: str) -> QLabel:
+    """長いパスでダイアログが横に伸びないよう、中ほどを省略して表示する（全体はツールチップ）。
+
+    パスには空白が無く、折り返し（wordWrap）では折り返されない。
+    """
+    label = QLabel()
+    label.setText(label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideMiddle, _TEXT_WIDTH))
+    label.setToolTip(text)
+    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    return label
+
+
 class DocumentPropertiesDialog(QDialog):
     def __init__(self, path: str, pages: int, layout: Layout, parent=None):
         super().__init__(parent)
@@ -37,8 +53,8 @@ class DocumentPropertiesDialog(QDialog):
 
         summary = QWidget()
         form = QFormLayout(summary)
-        form.addRow("ファイル:", QLabel(p.name))
-        form.addRow("場所:", QLabel(str(p.parent)))
+        form.addRow("ファイル:", _elided_label(p.name))
+        form.addRow("場所:", _elided_label(str(p.parent)))
         try:
             size_mb = p.stat().st_size / 1e6
             form.addRow("ファイルサイズ:", QLabel(f"{size_mb:,.1f} MB"))
