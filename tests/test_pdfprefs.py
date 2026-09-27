@@ -49,3 +49,12 @@ def test_existing_viewer_preferences_are_kept(tmp_path):
     with pikepdf.open(p) as pdf:
         assert pdf.Root.ViewerPreferences.HideToolbar is True
         assert pdf.Root.ViewerPreferences.Direction == "/R2L"
+
+
+def test_direction_is_set(tmp_path):
+    from book_viewer.pdfprefs import direction_is_set
+    p = tmp_path / "a.pdf"
+    _make_pdf(p)
+    assert direction_is_set(p) is False
+    write_layout(p, Layout(False, True, False))
+    assert direction_is_set(p) is True

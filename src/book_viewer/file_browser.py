@@ -45,8 +45,10 @@ from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileIconProvider,
-    QGroupBox,
+    QHBoxLayout,
     QHeaderView,
+    QLabel,
+    QToolButton,
     QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
@@ -153,6 +155,7 @@ class _Tree(QTreeWidget):
 
 class FileBrowserPanel(QWidget):
     pdf_clicked = Signal(Path)
+    close_requested = Signal()            # 見出しの ✕
     start_dir_changed = Signal(Path)      # .. で起動フォルダを付け替えたとき
 
     def __init__(
@@ -160,14 +163,10 @@ class FileBrowserPanel(QWidget):
         start_dir: Path,
         progress: Callable[[str], tuple[int, int] | None],
         *,
-        font_size_large: int = 20,
+        font_size: int = 16,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        # iq-analyzer はアプリ全体を 20pt にしている。ここではパネルだけに当てる
-        font = QFont(self.font())
-        font.setPointSize(font_size_large)
-        self.setFont(font)
 
         self._start_dir = Path(start_dir)
         self._progress = progress
@@ -193,8 +192,24 @@ class FileBrowserPanel(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        group = QGroupBox("ファイルブラウザ")
-        layout = QVBoxLayout(group)
+        # 見出しは「ページサムネール」と同じ形（太字 + ✕）。QGroupBox の見出しは
+        # macOS が文字設定に関係なく小さく描くので使わない（枠だけ使う）
+        title = QLabel("ファイルブラウザ")
+        title.setStyleSheet("font-weight: bold;")
+        close = QToolButton()
+        close.setText("✕")
+        close.setAutoRaise(True)
+        close.setStyleSheet("QToolButton { border: none; background: transparent; padding: 2px 6px; }"
+                            "QToolButton:hover { background: palette(midlight); border-radius: 4px; }")
+        close.setToolTip("フォルダツリーを閉じる")
+        close.clicked.connect(self.close_requested.emit)
+        head = QHBoxLayout()
+        head.setContentsMargins(6, 4, 2, 0)
+        head.addWidget(title, 1)
+        head.addWidget(close)
+        outer.addLayout(head)
+        # フラット: 枠（QGroupBox）もツリーの縁取りも無し。パネルの境目は分割線 1px だけ
+        layout = outer
 
         self.tree = _Tree(self._tooltip)
         self.tree.setColumnCount(2)
@@ -202,16 +217,15 @@ class FileBrowserPanel(QWidget):
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.setUniformRowHeights(True)
         self.tree.setExpandsOnDoubleClick(False)      # 開閉はシングルクリックで行う
-        self.tree.setIconSize(QSize(font_size_large + 4, font_size_large + 4))
+        self.tree.setIconSize(QSize(font_size + 4, font_size + 4))
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.setStyleSheet(f"QTreeWidget {{ font-size: {font_size_large}pt; }}")
         self.tree.itemExpanded.connect(self._ensure_loaded)
         self.tree.itemClicked.connect(self._on_clicked)
+        self.tree.setFrameShape(QTreeWidget.Shape.NoFrame)
         layout.addWidget(self.tree)
-        outer.addWidget(group)
 
         self._build_roots()
         if Path("/Volumes").is_dir():

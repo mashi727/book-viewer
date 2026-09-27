@@ -42,6 +42,13 @@ class Store:
     def last_dir(self, value: str) -> None:
         self._data["last_dir"] = value
 
+    def ui(self, key: str, default):
+        """パネルの表示・非表示など、ビューア全体の設定。"""
+        return self._data.get("ui", {}).get(key, default)
+
+    def set_ui(self, key: str, value) -> None:
+        self._data.setdefault("ui", {})[key] = value
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")

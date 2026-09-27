@@ -2,48 +2,65 @@
 
   book-viewer [フォルダ | PDF]
 
-左は本棚（Windows エクスプローラー風のフォルダツリー。起動フォルダ・ホーム・この Mac の各ドライブ）。
-PDF をクリックで右に表示し、前回読んでいた位置から再開する。読書列は進捗、
-PDF にマウスを乗せると表紙のサムネイルが出る。
+画面は左から フォルダツリー | ページサムネール | ページ。フォルダツリーは Windows
+エクスプローラー風、それ以外の操作・用語・ショートカットは Adobe Acrobat に揃える。
 
-  開き方（PDF 本体に書き込める。⌘S）:
-    B  … 右綴じ / 左綴じ      D … 見開き / 単ページ      C … 表紙を単独にする
+  ファイル:
+    ⌘O 開く…（PDF）   ⇧⌘O フォルダを開く…   ⌘W 閉じる   ⌘D 文書のプロパティ…
+  表示:
+    ページナビゲーション … 最初 / 前 / 次 / 最後のページ、⇧⌘N ページへ移動…
+    ページ表示 …… 単一ページ表示 / 見開きページ表示 / 見開きページ表示で表紙を表示
+    表示切り替え … F4 ページサムネール、フォルダツリー
+  ツールバーの「見開きページ表示 ▾」… 本体で見開きに切替、▾ で表紙あり / なしを選ぶ
+    ⌘L 全画面モード（Esc で解除）
   読書:
     → ← Space ホイール クリック … ページ送り（詳細は spread_view.py）
-    F / Esc … 全画面 / 解除      ⌘O … フォルダをツリーで開く
-    フォルダをクリック … 開閉      ⌘↑ … 親フォルダを選択して閉じる
+    ツールバーの ↑ ↓ とページ番号欄 … 前 / 次のページ、番号を入れて Enter で移動
+  本棚（フォルダツリー）:
+    フォルダをクリック … 開閉   ⌘↑ … 親フォルダを選択して閉じる
     .. … 起動フォルダを 1 つ上へ付け替える（起動フォルダを選択中の ⌘↑ も同じ）
+  開き方の保存:
+    ⌘D の「開き方 › ページレイアウト」と「詳細設定 › 綴じ方」を OK で PDF に書き込む。
+    表示メニューのページ表示は、その場の表示だけを変える（Acrobat と同じ）
   自動再読込:
     表示中の PDF が書き換えられたら（TeX の再コンパイル等）、書き込みが落ち着くのを
-    待って読み込み直す。ページ位置と、ビューア上の開き方は保つ。
+    待って読み込み直す。ページ位置と、その場の表示は保つ。
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtCore import QFileSystemWatcher, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QFont, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
-    QSizePolicy,
     QSplitter,
     QStatusBar,
     QToolBar,
-    QWidget,
+    QToolButton,
+    QToolTip,
 )
 
-from . import pdfprefs
+from . import direction, pdfprefs
 from .file_browser import FileBrowserPanel
 from .layout import Layout
+from .properties import DocumentPropertiesDialog
 from .spread_view import SpreadView
 from .state import Store, state_dir
+from .thumbnails import ThumbnailPane
 
+_DEFAULT_SIZE = QSize(1920, 1080)   # 既定のウィンドウサイズ（FHD）。画面が小さければ収まる大きさに縮める
+_UI_PT = 16                  # アプリ内の文字はすべてこの大きさ（macOS の既定は 13pt、ツールバー 10pt、ツールチップ 11pt）
 _RELOAD_SETTLE_MS = 400      # 書き込みが止んだと見なすまでの待ち
 _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ諦める
 
@@ -51,37 +68,48 @@ _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ
 class BookViewer(QMainWindow):
     def __init__(self, directory: str, open_pdf: str | None = None):
         super().__init__()
+        self._apply_ui_font()
         self.setWindowTitle("Book Viewer")
-        self.resize(1400, 900)
         self._store = Store()
         self._root = str(Path(directory).resolve())
         self._book: str | None = None
         self._saved_layout = Layout()       # PDF に書かれている開き方
+        self._rtl = False                   # 綴じ方は文書のプロパティ（Acrobat と同じく表示メニューには無い）
 
         # 左: 本棚（フォルダツリー）
-        self._browser = FileBrowserPanel(Path(self._root), self._store.position)
+        self._browser = FileBrowserPanel(Path(self._root), self._store.position, font_size=_UI_PT)
+        self._browser.close_requested.connect(lambda: self._set_tree_visible(False))
         self._browser.pdf_clicked.connect(lambda p: self._open_book(str(p)))
         self._browser.start_dir_changed.connect(lambda p: setattr(self, "_root", str(p)))
         self._browser.reveal(self._root)
 
-        # 右: 見開きビュー
+        # 中: ページサムネール
+        self._thumbs = ThumbnailPane()
+        self._thumbs.page_clicked.connect(lambda page: self._view.go_to_page(page))
+        self._thumbs.close_requested.connect(lambda: self._set_thumbs_visible(False))
+
+        # 右: ページ
         self._doc = QPdfDocument(self)
         self._view = SpreadView()
         self._view.pageChanged.connect(self._on_page_changed)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self._browser)
+        self._splitter.addWidget(self._thumbs)
         self._splitter.addWidget(self._view)
-        self._splitter.setStretchFactor(0, 0)
-        self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([420, 980])
+        for i, stretch in enumerate((0, 0, 1)):
+            self._splitter.setStretchFactor(i, stretch)
+        # フラットな 1px の分割線。1px でも Qt は掴める幅を 5px に広げる（見た目は 1px のまま）
+        self._splitter.setHandleWidth(1)
+        self._splitter.setStyleSheet("QSplitter::handle { background-color: palette(mid); }")
         self.setCentralWidget(self._splitter)
         self.setStatusBar(QStatusBar())
 
+        self._build_actions()
+        self._build_menus()
         self._build_toolbar()
 
-        QShortcut(QKeySequence(QKeySequence.StandardKey.Open), self).activated.connect(self._open_folder)
-        QShortcut(QKeySequence("Ctrl+Up"), self).activated.connect(self._go_up)
+        QShortcut(QKeySequence("Ctrl+Up"), self).activated.connect(self._browser.select_parent)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(
             lambda: self._set_fullscreen(False)
         )
@@ -103,11 +131,119 @@ class BookViewer(QMainWindow):
         self._save_timer.setInterval(1000)
         self._save_timer.timeout.connect(self._save_position)
 
+        self._apply_default_size()
+        self._set_tree_visible(self._store.ui("show_tree", True))
+        self._set_thumbs_visible(self._store.ui("show_thumbnails", True))
+        self._on_page_changed(0)
+
         if open_pdf:
             self._open_book(open_pdf)
             self._browser.reveal(open_pdf)
 
-    # ---- ツールバー ----
+    @staticmethod
+    def _apply_ui_font() -> None:
+        """アプリ内の文字を _UI_PT に揃える。
+
+        QApplication.setFont は既定の文字を変えるが、macOS がクラスごとに割り当てた
+        小さい文字（ツールバーのボタン、ポップアップメニュー）とツールチップには
+        効かないので、それらは個別に設定する（_build_toolbar と下の QToolTip）。
+        """
+        font = QFont(QApplication.font())
+        font.setPointSize(_UI_PT)
+        QApplication.setFont(font)
+        QToolTip.setFont(font)
+
+    def _apply_default_size(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        w = min(_DEFAULT_SIZE.width(), avail.width())
+        h = min(_DEFAULT_SIZE.height(), avail.height())
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
+        self._splitter.setSizes([420, 170, max(400, w - 590)])
+
+    # ---- アクション（メニューとツールバーで共有） ----
+
+    def _action(self, text: str, shortcut: str | QKeySequence.StandardKey | None = None,
+                slot=None, checkable: bool = False, tip: str | None = None) -> QAction:
+        a = QAction(text, self)
+        if shortcut is not None:
+            a.setShortcut(QKeySequence(shortcut))
+        a.setCheckable(checkable)
+        seq = a.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+        a.setToolTip(f"{tip or text} ({seq})" if seq else (tip or text))
+        if slot is not None:
+            if checkable:
+                a.triggered.connect(slot)                         # checked を受け取る
+            else:
+                a.triggered.connect(lambda _checked=False, s=slot: s())
+        return a
+
+    def _build_actions(self) -> None:
+        A = self._action
+        # ファイル
+        self._act_open = A("開く…", QKeySequence.StandardKey.Open, self._open_file, tip="PDF を開く")
+        self._act_open_folder = A("フォルダを開く…", "Ctrl+Shift+O", self._open_folder)
+        self._act_close = A("閉じる", QKeySequence.StandardKey.Close, self._close_book)
+        self._act_props = A("文書のプロパティ…", "Ctrl+D", self._show_properties)
+        # ページナビゲーション（←→ Home End はページビューが受け持つので、ここでは割り当てない。
+        # 割り当てるとフォルダツリーやページ番号欄で矢印キーが使えなくなる）
+        self._act_first = A("最初のページ", None, self._view.first)
+        self._act_prev = A("前のページ", None, lambda: self._view.go(-1), tip="前のページを表示")
+        self._act_next = A("次のページ", None, lambda: self._view.go(+1), tip="次のページを表示")
+        self._act_last = A("最後のページ", None, self._view.last)
+        self._act_goto = A("ページへ移動…", "Ctrl+Shift+N", self._go_to_page_dialog)
+        # ページ表示
+        self._act_single = A("単一ページ表示", None, self._on_view_layout_changed, checkable=True)
+        self._act_spread = A("見開きページ表示", None, self._on_view_layout_changed, checkable=True)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        group.addAction(self._act_single)
+        group.addAction(self._act_spread)
+        self._act_single.setChecked(True)
+        self._act_cover = A("見開きページ表示で表紙を表示", None, self._on_view_layout_changed, checkable=True)
+        self._act_cover.setChecked(True)
+        # ツールバーの「見開きページ表示 ▾」のプルダウン。表示メニューのチェックと同じ状態を持つ
+        self._act_cover_on = A("見開きページ（表紙あり）", None, lambda on: self._set_cover(True),
+                               checkable=True, tip="1 ページ目（表紙）を単独で表示する")
+        self._act_cover_off = A("見開きページ（表紙なし）", None, lambda on: self._set_cover(False),
+                                checkable=True, tip="1 ページ目から 2 ページずつ並べる")
+        cover_group = QActionGroup(self)
+        cover_group.setExclusive(True)
+        cover_group.addAction(self._act_cover_on)
+        cover_group.addAction(self._act_cover_off)
+        self._act_cover_on.setChecked(True)
+        # 表示切り替え
+        self._act_thumbs = A("ページサムネール", "F4", self._set_thumbs_visible, checkable=True,
+                             tip="ページサムネールを表示 / 非表示")
+        self._act_tree = A("フォルダツリー", None, self._set_tree_visible, checkable=True,
+                           tip="フォルダツリーを表示 / 非表示")
+        self._act_full = A("全画面モード", "Ctrl+L", self._set_fullscreen, checkable=True)
+
+    def _build_menus(self) -> None:
+        mb = self.menuBar()
+        m = mb.addMenu("ファイル")
+        m.addActions([self._act_open, self._act_open_folder])
+        m.addSeparator()
+        m.addAction(self._act_close)
+        m.addSeparator()
+        m.addAction(self._act_props)
+
+        m = mb.addMenu("表示")
+        nav = m.addMenu("ページナビゲーション")
+        nav.addActions([self._act_first, self._act_prev, self._act_next, self._act_last])
+        nav.addSeparator()
+        nav.addAction(self._act_goto)
+        disp = m.addMenu("ページ表示")
+        disp.addActions([self._act_single, self._act_spread])
+        disp.addSeparator()
+        disp.addAction(self._act_cover)
+        toggle = m.addMenu("表示切り替え")
+        panes = toggle.addMenu("ナビゲーションパネル")
+        panes.addAction(self._act_thumbs)
+        toggle.addAction(self._act_tree)
+        m.addSeparator()
+        m.addAction(self._act_full)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("main")
@@ -115,82 +251,124 @@ class BookViewer(QMainWindow):
         self.addToolBar(tb)
         self._toolbar = tb
 
-        def action(text: str, shortcut: str, tip: str, checkable=False, slot=None) -> QAction:
-            a = QAction(text, self)
-            a.setShortcut(QKeySequence(shortcut))
-            a.setToolTip(f"{tip} ({QKeySequence(shortcut).toString(QKeySequence.SequenceFormat.NativeText)})")
-            a.setCheckable(checkable)
-            if slot == self._set_fullscreen:
-                a.triggered.connect(slot)                   # checked を受け取る
-            elif slot:
-                a.triggered.connect(lambda _checked=False, s=slot: s())
-            tb.addAction(a)
-            return a
+        self._act_prev.setIconText("↑")
+        self._act_next.setIconText("↓")
+        tb.addAction(self._act_open)
+        tb.addSeparator()
+        tb.addAction(self._act_thumbs)
+        tb.addSeparator()
+        tb.addAction(self._act_prev)
+        tb.addAction(self._act_next)
+        self._page_box = QLineEdit()
+        self._page_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._page_box.setFixedWidth(70)
+        self._page_box.setToolTip("ページ番号を入れて Enter で移動")
+        self._page_box.returnPressed.connect(self._on_page_box)
+        tb.addWidget(self._page_box)
+        self._page_total = QLabel()
+        self._page_total.setContentsMargins(4, 0, 8, 0)
+        tb.addWidget(self._page_total)
+        tb.addSeparator()
+        tb.addAction(self._act_single)
+        spread_btn = QToolButton()
+        spread_btn.setDefaultAction(self._act_spread)
+        spread_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)   # 本体=切替、▾=表紙の有無
+        cover_menu = QMenu(spread_btn)
+        cover_menu.setFont(QApplication.font())       # macOS はメニューに小さい文字を割り当てる
+        cover_menu.addActions([self._act_cover_on, self._act_cover_off])
+        spread_btn.setMenu(cover_menu)
+        tb.addWidget(spread_btn)
+        tb.addSeparator()
+        tb.addAction(self._act_full)
 
-        action("📂", "Ctrl+O", "フォルダを開く", slot=self._open_folder).setShortcut(QKeySequence())
-        tb.addSeparator()
-        self._act_rtl = action("右綴じ", "B", "右綴じ / 左綴じ", True, self._on_layout_toggled)
-        self._act_spread = action("見開き", "D", "見開き / 単ページ", True, self._on_layout_toggled)
-        self._act_cover = action("表紙単独", "C", "見開きで表紙を単独ページにする", True, self._on_layout_toggled)
-        tb.addSeparator()
-        self._act_save = action("PDFに保存", "Ctrl+S", "開き方を PDF 本体に書き込む", slot=self._save_layout)
-        tb.addSeparator()
-        self._act_full = action("全画面", "F", "全画面", True, self._set_fullscreen)
+        # ボタンはアクション追加時に作られるので、最後にまとめて文字を大きくする
+        font = QApplication.font()
+        for w in (tb, self._page_box, self._page_total, *tb.findChildren(QToolButton)):
+            w.setFont(font)
 
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
-        self._page_label = QLabel()
-        self._page_label.setContentsMargins(0, 0, 8, 0)
-        tb.addWidget(self._page_label)
-        self._sync_actions(Layout())
+    # ---- 開き方（表示）と文書のプロパティ ----
 
     def _current_layout(self) -> Layout:
         return Layout(
             spread=self._act_spread.isChecked(),
             cover_single=self._act_cover.isChecked(),
-            rtl=self._act_rtl.isChecked(),
+            rtl=self._rtl,
         )
 
-    def _sync_actions(self, layout: Layout) -> None:
-        for a, v in ((self._act_rtl, layout.rtl), (self._act_spread, layout.spread),
-                     (self._act_cover, layout.cover_single)):
-            a.blockSignals(True)
-            a.setChecked(v)
-            a.blockSignals(False)
-        self._update_action_state()
-
-    def _update_action_state(self) -> None:
-        layout = self._current_layout()
+    def _apply_layout(self, layout: Layout) -> None:
+        """PDF の開き方を表示メニューに反映して、ページビューに適用する。"""
+        self._rtl = layout.rtl
+        # setChecked は toggled しか出さず、スロットは triggered（ユーザー操作）に繋いでいるので
+        # シグナルを止める必要はない。止めると QActionGroup が選択の切り替わりを知らず、
+        # 「単一」と「見開き」が両方チェックされたままになる
+        self._act_spread.setChecked(layout.spread)
+        self._act_single.setChecked(not layout.spread)
+        self._act_cover.setChecked(layout.cover_single)
         self._act_cover.setEnabled(layout.spread)
-        dirty = self._book is not None and layout != self._saved_layout
-        self._act_save.setEnabled(dirty)
-        self._act_save.setText("PDFに保存 •" if dirty else "PDFに保存")
+        self._sync_cover_choice(layout.cover_single)
+        self._view.set_layout(layout)
 
-    def _on_layout_toggled(self) -> None:
+    def _on_view_layout_changed(self, _checked: bool = False) -> None:
+        self._act_cover.setEnabled(self._act_spread.isChecked())
+        self._sync_cover_choice(self._act_cover.isChecked())
         self._view.set_layout(self._current_layout())
-        self._update_action_state()
 
-    def _save_layout(self) -> None:
+    def _set_cover(self, cover: bool) -> None:
+        """プルダウンで表紙の有無を選んだ。見開きでなければ見開きにする。"""
+        self._act_cover.setChecked(cover)
+        self._act_spread.setChecked(True)
+        self._on_view_layout_changed()
+
+    def _sync_cover_choice(self, cover: bool) -> None:
+        (self._act_cover_on if cover else self._act_cover_off).setChecked(True)
+
+    def _show_properties(self) -> None:
         if not self._book:
             return
-        layout = self._current_layout()
+        # 初期値は「いま見えている表示」。表示を整えてから ⌘D → OK で、見たとおりに保存できる
+        dlg = DocumentPropertiesDialog(self._book, self._view.page_count(), self._current_layout(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        layout = dlg.result_layout()
+        if layout == self._saved_layout:
+            return
         try:
             pdfprefs.write_layout(self._book, layout, log_path=state_dir() / "prefs-log.jsonl")
         except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
             QMessageBox.warning(self, "PDF に保存できませんでした", f"{Path(self._book).name}\n\n{e}")
             return
         self._saved_layout = layout
-        self._update_action_state()
+        self._apply_layout(layout)
         self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
         # 置き換えたファイルは直後に fileChanged が来て再読込される
+
+    # ---- 表示切り替え ----
+
+    def _set_thumbs_visible(self, on: bool) -> None:
+        on = bool(on)
+        self._act_thumbs.setChecked(on)
+        self._thumbs.setVisible(on)
+        self._store.set_ui("show_thumbnails", on)
+        self._store.save()
+        if on:
+            self._thumbs.set_current_pages(self._view.current_group())
+
+    def _set_tree_visible(self, on: bool) -> None:
+        on = bool(on)
+        self._act_tree.setChecked(on)
+        self._browser.setVisible(on)
+        self._store.set_ui("show_tree", on)
+        self._store.save()
 
     def _set_fullscreen(self, on: bool) -> None:
         on = bool(on)
         if on == self.isFullScreen():
+            self._act_full.setChecked(on)
             return
         self._act_full.setChecked(on)
-        self._browser.setVisible(not on)
+        # 全画面ではページだけにする。解除したら表示切り替えの状態に戻す
+        self._browser.setVisible(not on and self._act_tree.isChecked())
+        self._thumbs.setVisible(not on and self._act_thumbs.isChecked())
         self.statusBar().setVisible(not on)
         self._toolbar.setVisible(not on)
         if on:
@@ -199,18 +377,20 @@ class BookViewer(QMainWindow):
             self.showNormal()
         self._view.setFocus()
 
-    # ---- 本棚 ----
+    # ---- 開く・閉じる ----
 
-    def _go_up(self) -> None:
-        self._browser.select_parent()
+    def _open_file(self) -> None:
+        start = str(Path(self._book).parent) if self._book else self._root
+        chosen, _ = QFileDialog.getOpenFileName(self, "開く", start, "PDF (*.pdf *.PDF)")
+        if chosen:
+            self._open_book(chosen)
+            self._browser.reveal(chosen)
 
     def _open_folder(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "フォルダを開く", self._root)
         if chosen:
             self._root = chosen
             self._browser.reveal(chosen)
-
-    # ---- 本を開く ----
 
     def _open_book(self, path: str) -> None:
         path = str(Path(path).resolve())
@@ -225,33 +405,86 @@ class BookViewer(QMainWindow):
             return
         try:
             layout = pdfprefs.read_layout(path)
+            direction_set = pdfprefs.direction_is_set(path)
         except Exception:
-            layout = Layout()
+            layout, direction_set = Layout(), False
+        saved = layout
+        # 綴じ方が書かれていない本は、テキストレイヤーの文字の並びから縦書きかを推定する
+        # （画像だけの本は推定しない。⌘D で綴じ方を保存すれば次からはそれを使う）
+        guessed = None if direction_set else direction.detect(doc)
+        if guessed == "rtl":
+            layout = Layout(spread=layout.spread, cover_single=layout.cover_single, rtl=True)
         if self._book:
             self._file_watcher.removePath(self._book)
         self._book = path
-        self._saved_layout = layout
+        self._saved_layout = saved
         self._store.last_dir = str(Path(path).parent)
-        self._sync_actions(layout)
-        self._view.set_layout(layout)
+        self._apply_layout(layout)
         pos = self._store.position(path)
         old, self._doc = self._doc, doc
+        self._thumbs.set_document(path, doc.pageCount())
         self._view.set_document(doc, pos[0] if pos else 0)
         old.deleteLater()
         self._file_watcher.addPath(path)
         self._loaded_sig = self._file_sig(path)
         self.setWindowTitle(f"{Path(path).stem} — Book Viewer")
+        if guessed == "rtl":
+            self.statusBar().showMessage(
+                "本文が縦書きなので右綴じで表示しています（⌘D の綴じ方で PDF に保存できます）", 8000)
         self._view.setFocus()
+
+    def _close_book(self) -> None:
+        if not self._book:
+            return
+        self._save_position()
+        self._file_watcher.removePath(self._book)
+        self._book = None
+        self._thumbs.set_document(None, 0)
+        self._view.set_document(None)
+        self._doc.deleteLater()
+        self._doc = QPdfDocument(self)
+        self.setWindowTitle("Book Viewer")
+
+    # ---- ページ ----
 
     def _on_page_changed(self, _page: int) -> None:
         n = self._view.page_count()
         g = self._view.current_group()
-        if not n or not g:
-            self._page_label.setText("")
+        has = bool(n and g)
+        for a in (self._act_first, self._act_prev, self._act_next, self._act_last,
+                  self._act_goto, self._act_props, self._act_close):
+            a.setEnabled(has)
+        self._page_box.setEnabled(has)
+        if not has:
+            self._page_box.clear()
+            self._page_total.setText("")
             return
-        pages = "–".join(str(p + 1) for p in g)
-        self._page_label.setText(f"{pages} / {n}")
+        self._page_box.setValidator(QIntValidator(1, n, self._page_box))
+        self._page_box.setText(str(g[0] + 1))
+        self._page_total.setText(f"/ {n}")
+        self._act_prev.setEnabled(g[0] > 0)
+        self._act_first.setEnabled(g[0] > 0)
+        self._act_next.setEnabled(g[-1] < n - 1)
+        self._act_last.setEnabled(g[-1] < n - 1)
+        if self._thumbs.isVisible():
+            self._thumbs.set_current_pages(g)
         self._save_timer.start()
+
+    def _on_page_box(self) -> None:
+        text = self._page_box.text()
+        if text.isdigit():
+            self._view.go_to_page(int(text) - 1)
+        self._on_page_changed(0)          # 範囲外などは現在のページ番号に戻す
+        self._view.setFocus()
+
+    def _go_to_page_dialog(self) -> None:
+        n = self._view.page_count()
+        if not n:
+            return
+        page, ok = QInputDialog.getInt(self, "ページへ移動", f"ページ番号（1〜{n}）:",
+                                       self._view.current_page() + 1, 1, n)
+        if ok:
+            self._view.go_to_page(page - 1)
 
     def _save_position(self) -> None:
         if not self._book or not self._view.page_count():
@@ -335,15 +568,16 @@ class BookViewer(QMainWindow):
             pass
         page = self._view.current_page()
         old, self._doc = self._doc, doc
-        self._view.set_document(doc, page)      # ビューア上の開き方は保ったまま
+        self._thumbs.set_document(path, doc.pageCount())
+        self._view.set_document(doc, page)      # その場の表示は保ったまま
         old.deleteLater()
         self._loaded_sig = sig
-        self._update_action_state()
         self._browser.forget_thumbnail(path)
         self.statusBar().showMessage(f"再読み込みしました（{doc.pageCount()} ページ）", 3000)
 
     def closeEvent(self, event) -> None:
         self._save_position()
+        self._thumbs.shutdown()
         super().closeEvent(event)
 
 

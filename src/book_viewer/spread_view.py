@@ -8,6 +8,8 @@ QPdfView には見開きモードが無いので、QPdfDocument.render() で各�
     Space ↓ PageDown      … 次          ⇧Space ↑ PageUp … 前
     Home / End            … 先頭 / 末尾
     ホイール              … 積算して 1 ノッチ相当ごとに 1 組（慣性スクロールは無視）
+                            縦スクロール: 下 = 次。横スワイプ: 綴じ方向に沿う
+                            （左綴じは左へスワイプで次、右綴じは右へスワイプで次）
     クリック              … 左半分 = ←、右半分 = →
 """
 from __future__ import annotations
@@ -189,7 +191,12 @@ class SpreadView(QWidget):
             return
         if event.phase() in (Qt.ScrollPhase.ScrollBegin, Qt.ScrollPhase.ScrollEnd):
             self._wheel_acc = 0
-        self._wheel_acc += event.angleDelta().y()
+        delta = event.angleDelta()
+        if abs(delta.x()) > abs(delta.y()):
+            # 横スワイプ。x < 0 は「右へ進む」（指を左へ払う）。右綴じの本は逆向きに進む
+            self._wheel_acc += -delta.x() if self._layout.rtl else delta.x()
+        else:
+            self._wheel_acc += delta.y()
         while self._wheel_acc <= -_WHEEL_STEP:
             self._wheel_acc += _WHEEL_STEP
             self.go(+1)

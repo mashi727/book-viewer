@@ -54,6 +54,12 @@ def read_layout(path: str | os.PathLike) -> Layout:
         return _to_layout(_raw(pdf))
 
 
+def direction_is_set(path: str | os.PathLike) -> bool:
+    """綴じ方（/ViewerPreferences /Direction）が PDF に書かれているか。"""
+    with pikepdf.open(Path(path)) as pdf:
+        return _raw(pdf)["Direction"] is not None
+
+
 def write_layout(path: str | os.PathLike, layout: Layout, log_path: Path | None = None) -> None:
     """開き方を PDF に書き込む（アトミック置換）。"""
     path = Path(path)
