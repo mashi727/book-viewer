@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListView,
+    QMenu,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -161,6 +162,7 @@ class ThumbnailPane(QWidget):
 
     page_clicked = Signal(int)
     close_requested = Signal()
+    insert_blank_requested = Signal(int)     # 右クリックしたページ（0 始まり）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -201,6 +203,8 @@ class ThumbnailPane(QWidget):
         self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.view.setFrameShape(QListView.Shape.NoFrame)     # フラット（境目は分割線 1px）
         self.view.clicked.connect(lambda idx: self.page_clicked.emit(idx.row()))
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._context_menu)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -210,6 +214,16 @@ class ThumbnailPane(QWidget):
 
     def set_document(self, path: str | None, count: int) -> None:
         self.model.set_document(path, count)
+
+    def _context_menu(self, pos) -> None:
+        idx = self.view.indexAt(pos)
+        if not idx.isValid():
+            return
+        menu = QMenu(self)
+        menu.setFont(self.font())
+        menu.addAction(f"空白ページを挿入…（{idx.row() + 1} ページ）",
+                       lambda: self.insert_blank_requested.emit(idx.row()))
+        menu.exec(self.view.viewport().mapToGlobal(pos))
 
     def set_current_pages(self, pages: tuple[int, ...]) -> None:
         """表示中の組を選択状態にして見える位置までスクロールする。"""

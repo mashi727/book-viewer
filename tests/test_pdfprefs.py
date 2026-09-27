@@ -67,3 +67,56 @@ def test_temp_file_removed_on_failure(tmp_path):
     with pytest.raises(Exception):
         write_layout(p, Layout(True, True, True))
     assert not list(tmp_path.glob(".*tmp"))
+
+
+def _pdf_with_sizes(path, sizes, rotate_parent=None):
+    pdf = pikepdf.new()
+    for w, h in sizes:
+        pdf.add_blank_page(page_size=(w, h))
+    for page in pdf.pages:                           # 中身のあるページにする
+        page.obj.Contents = pdf.make_stream(b"0 0 m 10 10 l S")
+    if rotate_parent is not None:
+        pdf.Root.Pages.Rotate = rotate_parent        # 親の /Pages に書かれた回転（継承される）
+    pdf.save(path)
+
+
+def test_insert_blank_after_page_matches_size(tmp_path):
+    from book_viewer.pdfprefs import insert_blank_pages
+    p = tmp_path / "a.pdf"
+    log = tmp_path / "log.jsonl"
+    _pdf_with_sizes(p, [(420, 595), (500, 700), (420, 595)])
+    insert_blank_pages(p, index=2, count=2, log_path=log)      # 2 ページ目の後に 2 枚
+    with pikepdf.open(p) as pdf:
+        assert len(pdf.pages) == 5
+        for i in (2, 3):
+            assert [float(v) for v in pdf.pages[i].mediabox] == [0, 0, 500, 700]   # 直前のページに揃う
+            assert pdf.pages[i].obj.Contents.read_bytes() == b""
+        assert pdf.pages[1].obj.Contents.read_bytes() != b""  # 元のページは無傷
+        assert pdf.pages[4].obj.Contents.read_bytes() != b""
+    entry = json.loads(log.read_text().splitlines()[-1])
+    assert entry["action"] == "insert_blank" and entry["index"] == 2 and entry["count"] == 2
+    assert not list(tmp_path.glob(".*tmp"))
+
+
+def test_insert_blank_at_front_and_inherited_rotation(tmp_path):
+    from book_viewer.pdfprefs import insert_blank_pages, page_size_mm
+    p = tmp_path / "a.pdf"
+    _pdf_with_sizes(p, [(420, 595), (420, 595)], rotate_parent=90)
+    insert_blank_pages(p, index=0)                             # 先頭（1 ページ目に揃う）
+    with pikepdf.open(p) as pdf:
+        assert len(pdf.pages) == 3
+        assert int(pdf.pages[0].obj.Rotate) == 90             # 親から継承した回転を写す
+    w, h = page_size_mm(p, 0)
+    assert round(w) == 210 and round(h) == 148                 # 90° 回転なので横長
+
+
+def test_insert_blank_rejects_out_of_range(tmp_path):
+    import pytest
+    from book_viewer.pdfprefs import insert_blank_pages
+    p = tmp_path / "a.pdf"
+    _pdf_with_sizes(p, [(420, 595)])
+    with pytest.raises(ValueError):
+        insert_blank_pages(p, index=5)
+    with pikepdf.open(p) as pdf:
+        assert len(pdf.pages) == 1
+    assert not list(tmp_path.glob(".*tmp"))

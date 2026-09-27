@@ -6,7 +6,9 @@
 エクスプローラー風、それ以外の操作・用語・ショートカットは Adobe Acrobat に揃える。
 
   ファイル:
-    ⌘O 開く…（PDF）   ⇧⌘O フォルダを開く…   ⌘W 閉じる   ⌘D 文書のプロパティ…
+    ⌘O 開く…（PDF）   ⇧⌘O フォルダを開く…   ⌘S 保存   ⌘W 閉じる   ⌘D 文書のプロパティ…
+  文書:
+    ⇧⌘T 空白ページを挿入…（基準ページと同じ大きさ。サムネールの右クリックからも）
   表示:
     ページナビゲーション … 最初 / 前 / 次 / 最後のページ、⇧⌘N ページへ移動…
     ページ表示 …… 単一ページ表示 / 見開きページ表示 / 見開きページ表示で表紙を表示
@@ -22,7 +24,8 @@
     .. … 起動フォルダを 1 つ上へ付け替える（起動フォルダを選択中の ⌘↑ も同じ）
   開き方の保存:
     ⌘D の「開き方 › ページレイアウト」と「詳細設定 › 綴じ方」を OK で PDF に書き込む。
-    表示メニューのページ表示は、その場の表示だけを変える（Acrobat と同じ）
+    ツールバー（単一 / 見開き▾ / 左綴じ / 右綴じ）と表示メニューでも同じ項目を切り替えられ、
+    ［保存］か ⌘S でいまの表示を PDF に書き込む。PDF と違う表示のときだけ［保存 •］になる
   自動再読込:
     表示中の PDF が書き換えられたら（TeX の再コンパイル等）、書き込みが落ち着くのを
     待って読み込み直す。ページ位置と、その場の表示は保つ。
@@ -57,6 +60,7 @@ from PySide6.QtWidgets import (
 from . import direction, pdfprefs
 from .file_browser import FileBrowserPanel
 from .layout import Layout
+from .insert_dialog import InsertBlankDialog
 from .properties import DocumentPropertiesDialog
 from .spread_view import SpreadView
 from .state import Store, state_dir
@@ -70,6 +74,12 @@ _RELOAD_SETTLE_MS = 400      # 書き込みが止んだと見なすまでの待�
 _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ諦める
 
 
+
+def _log_path() -> Path:
+    """PDF への書き込み履歴（開き方の変更前の値、空白ページの挿入位置）。"""
+    return state_dir() / "prefs-log.jsonl"
+
+
 class BookViewer(QMainWindow):
     def __init__(self, directory: str, open_pdf: str | None = None):
         super().__init__()
@@ -79,7 +89,6 @@ class BookViewer(QMainWindow):
         self._root = str(Path(directory).resolve())
         self._book: str | None = None
         self._saved_layout = Layout()       # PDF に書かれている開き方
-        self._rtl = False                   # 綴じ方は文書のプロパティ（Acrobat と同じく表示メニューには無い）
 
         # 左: 本棚（フォルダツリー）
         self._browser = FileBrowserPanel(Path(self._root), self._store.position, font_size=_UI_PT)
@@ -92,6 +101,7 @@ class BookViewer(QMainWindow):
         self._thumbs = ThumbnailPane()
         self._thumbs.page_clicked.connect(lambda page: self._view.go_to_page(page))
         self._thumbs.close_requested.connect(lambda: self._set_thumbs_visible(False))
+        self._thumbs.insert_blank_requested.connect(self._show_insert_blank)
 
         # 右: ページ
         self._doc = QPdfDocument(self)
@@ -142,6 +152,7 @@ class BookViewer(QMainWindow):
         self._set_thumbs_visible(self._store.ui("show_thumbnails", True))
         self._view.set_zoom(self._store.ui("zoom_mode", "page"), self._store.ui("zoom_percent", 100.0))
         self._on_page_changed(0)
+        self._update_save_state()               # 本を開くまでは保存できない
 
         if open_pdf:
             self._open_book(open_pdf)
@@ -191,8 +202,12 @@ class BookViewer(QMainWindow):
         # ファイル
         self._act_open = A("開く…", QKeySequence.StandardKey.Open, self._open_file, tip="PDF を開く")
         self._act_open_folder = A("フォルダを開く…", "Ctrl+Shift+O", self._open_folder)
+        self._act_save = A("保存", QKeySequence.StandardKey.Save, self._save_current,
+                           tip="いまの表示（ページレイアウト・綴じ方）を PDF に保存")
         self._act_close = A("閉じる", QKeySequence.StandardKey.Close, self._close_book)
         self._act_props = A("文書のプロパティ…", "Ctrl+D", self._show_properties)
+        self._act_insert_blank = A("空白ページを挿入…", "Ctrl+Shift+T", self._show_insert_blank,
+                                   tip="基準ページと同じ大きさの空白ページを挿入")
         # ページナビゲーション（←→ Home End はページビューが受け持つので、ここでは割り当てない。
         # 割り当てるとフォルダツリーやページ番号欄で矢印キーが使えなくなる）
         self._act_first = A("最初のページ", None, self._view.first)
@@ -220,6 +235,16 @@ class BookViewer(QMainWindow):
         cover_group.addAction(self._act_cover_on)
         cover_group.addAction(self._act_cover_off)
         self._act_cover_on.setChecked(True)
+        # 綴じ方（文書のプロパティ › 詳細設定 と同じ項目。ボタンで切り替えて表示に即反映、保存は ⌘S）
+        self._act_ltr = A("左綴じ", None, self._on_view_layout_changed, checkable=True,
+                          tip="左綴じ（横書き。→ で次のページ）")
+        self._act_rtl = A("右綴じ", None, self._on_view_layout_changed, checkable=True,
+                          tip="右綴じ（縦書き。← で次のページ）")
+        binding = QActionGroup(self)
+        binding.setExclusive(True)
+        binding.addAction(self._act_ltr)
+        binding.addAction(self._act_rtl)
+        self._act_ltr.setChecked(True)
         # 表示切り替え
         self._act_thumbs = A("ページサムネール", "F4", self._set_thumbs_visible, checkable=True,
                              tip="ページサムネールを表示 / 非表示")
@@ -240,9 +265,12 @@ class BookViewer(QMainWindow):
         m = mb.addMenu("ファイル")
         m.addActions([self._act_open, self._act_open_folder])
         m.addSeparator()
-        m.addAction(self._act_close)
+        m.addActions([self._act_save, self._act_close])
         m.addSeparator()
         m.addAction(self._act_props)
+
+        m = mb.addMenu("文書")
+        m.addAction(self._act_insert_blank)
 
         m = mb.addMenu("表示")
         nav = m.addMenu("ページナビゲーション")
@@ -253,6 +281,8 @@ class BookViewer(QMainWindow):
         disp.addActions([self._act_single, self._act_spread])
         disp.addSeparator()
         disp.addAction(self._act_cover)
+        disp.addSeparator()
+        disp.addActions([self._act_ltr, self._act_rtl])
         zoom = m.addMenu("ズーム")
         zoom.addActions([self._act_zoom_in, self._act_zoom_out])
         zoom.addSeparator()
@@ -273,6 +303,7 @@ class BookViewer(QMainWindow):
         self._act_prev.setIconText("↑")
         self._act_next.setIconText("↓")
         tb.addAction(self._act_open)
+        tb.addAction(self._act_save)
         tb.addSeparator()
         tb.addAction(self._act_thumbs)
         tb.addSeparator()
@@ -314,8 +345,19 @@ class BookViewer(QMainWindow):
         spread_btn.setMenu(cover_menu)
         tb.addWidget(spread_btn)
         tb.addSeparator()
+        tb.addAction(self._act_ltr)
+        tb.addAction(self._act_rtl)
+        tb.addSeparator()
         tb.addAction(self._act_full)
 
+        # macOS の既定では「選択中」のボタンの文字が薄く、押せない（無効）ボタンと見分けにくい。
+        # 選択中は灰色の背景に通常の文字色（アクセント色はウィンドウが非アクティブだと淡くなり
+        # 白い文字が読みにくい）。無効は薄い文字。▾ 付きのボタンは ▾ の分の余白を取る
+        tb.setStyleSheet(
+            "QToolButton { padding: 2px 6px; }"
+            "QToolButton:checked { background: palette(mid); color: palette(text); border-radius: 4px; }"
+            "QToolButton:disabled { color: palette(mid); }"
+            'QToolButton[popupMode="1"] { padding-right: 18px; }')
         # ボタンはアクション追加時に作られるので、最後にまとめて文字を大きくする
         font = QApplication.font()
         for w in (tb, self._page_box, self._page_total, self._zoom_box, *tb.findChildren(QToolButton)):
@@ -328,12 +370,11 @@ class BookViewer(QMainWindow):
         return Layout(
             spread=self._act_spread.isChecked(),
             cover_single=self._act_cover.isChecked(),
-            rtl=self._rtl,
+            rtl=self._act_rtl.isChecked(),
         )
 
     def _apply_layout(self, layout: Layout) -> None:
-        """PDF の開き方を表示メニューに反映して、ページビューに適用する。"""
-        self._rtl = layout.rtl
+        """開き方をボタン・表示メニューに反映して、ページビューに適用する。"""
         # setChecked は toggled しか出さず、スロットは triggered（ユーザー操作）に繋いでいるので
         # シグナルを止める必要はない。止めると QActionGroup が選択の切り替わりを知らず、
         # 「単一」と「見開き」が両方チェックされたままになる
@@ -342,12 +383,33 @@ class BookViewer(QMainWindow):
         self._act_cover.setChecked(layout.cover_single)
         self._act_cover.setEnabled(layout.spread)
         self._sync_cover_choice(layout.cover_single)
+        self._act_rtl.setChecked(layout.rtl)
+        self._act_ltr.setChecked(not layout.rtl)
         self._view.set_layout(layout)
+        self._update_save_state()
 
     def _on_view_layout_changed(self, _checked: bool = False) -> None:
         self._act_cover.setEnabled(self._act_spread.isChecked())
         self._sync_cover_choice(self._act_cover.isChecked())
         self._view.set_layout(self._current_layout())
+        self._update_save_state()
+
+    def _update_save_state(self) -> None:
+        """いまの表示が PDF に書かれた開き方と違うときだけ保存できる（「保存 •」）。"""
+        dirty = self._book is not None and self._current_layout() != self._saved_layout
+        self._act_save.setEnabled(dirty)
+        self._act_save.setText("保存 •" if dirty else "保存")
+
+    def _save_current(self) -> None:
+        """［保存］・⌘S: いまの表示（ページレイアウト・綴じ方）を PDF に保存する。"""
+        if not self._book or self._current_layout() == self._saved_layout:
+            return
+        try:
+            self._write_layout(self._current_layout())
+        except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
+            QMessageBox.warning(self, "PDF に保存できませんでした", f"{Path(self._book).name}\n\n{e}")
+            return
+        self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
 
     def _set_cover(self, cover: bool) -> None:
         """プルダウンで表紙の有無を選んだ。見開きでなければ見開きにする。"""
@@ -376,7 +438,36 @@ class BookViewer(QMainWindow):
         self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
 
     def _write_layout(self, layout: Layout) -> None:
-        """開き方を PDF に書き込み、表示に反映する。
+        """開き方を PDF に書き込み、表示に反映する。"""
+        self._modify_pdf(lambda path: pdfprefs.write_layout(path, layout, log_path=_log_path()))
+        self._saved_layout = layout
+        self._apply_layout(layout)
+
+    def _insert_blank(self, index: int, count: int, ref: int) -> None:
+        """空白ページを挿入する。挿入位置より後ろを読んでいたら、同じ内容のページを見せ続ける。"""
+        self._modify_pdf(
+            lambda path: pdfprefs.insert_blank_pages(path, index, count, ref, log_path=_log_path()),
+            page_after=lambda page: page + count if index <= page else page,
+        )
+        self.statusBar().showMessage(f"空白ページを {count} 枚挿入しました（{index + 1} ページ目から）", 5000)
+
+    def _show_insert_blank(self, page: int | None = None) -> None:
+        if not self._book:
+            return
+        book = self._book
+        dlg = InsertBlankDialog(self._view.page_count(),
+                                self._view.current_page() if page is None else page,
+                                lambda p: pdfprefs.page_size_mm(book, p), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        index, count, ref = dlg.insertion()
+        try:
+            self._insert_blank(index, count, ref)
+        except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
+            QMessageBox.warning(self, "空白ページを挿入できませんでした", f"{Path(book).name}\n\n{e}")
+
+    def _modify_pdf(self, write, page_after=lambda page: page) -> None:
+        """表示中の PDF を書き換えて開き直す（開き方の保存・空白ページの挿入で共通）。
 
         Windows では開いているファイルを置き換えられない（os.replace が WinError 5）。
         ページビューとサムネイルのスレッドが PDF を開いたままなので、書き込みの間だけ
@@ -389,9 +480,13 @@ class BookViewer(QMainWindow):
         page = self._view.current_page()
         self._thumbs.release_file()
         self._doc.close()
+        ok = False
         try:
-            pdfprefs.write_layout(path, layout, log_path=state_dir() / "prefs-log.jsonl")
+            write(path)
+            ok = True
         finally:
+            if ok:
+                page = page_after(page)
             doc = QPdfDocument(self)
             doc.load(path)
             old, self._doc = self._doc, doc
@@ -401,8 +496,6 @@ class BookViewer(QMainWindow):
             self._loaded_sig = self._file_sig(path)     # 自分の書き込みで再読込が走らないように
             if path not in self._file_watcher.files():
                 self._file_watcher.addPath(path)
-        self._saved_layout = layout
-        self._apply_layout(layout)
 
     # ---- ズーム ----
 
@@ -540,6 +633,7 @@ class BookViewer(QMainWindow):
         self._doc.deleteLater()
         self._doc = QPdfDocument(self)
         self.setWindowTitle("Book Viewer")
+        self._update_save_state()
 
     # ---- ページ ----
 
@@ -548,7 +642,7 @@ class BookViewer(QMainWindow):
         g = self._view.current_group()
         has = bool(n and g)
         for a in (self._act_first, self._act_prev, self._act_next, self._act_last,
-                  self._act_goto, self._act_props, self._act_close):
+                  self._act_goto, self._act_props, self._act_close, self._act_insert_blank):
             a.setEnabled(has)
         self._page_box.setEnabled(has)
         if not has:
@@ -662,6 +756,7 @@ class BookViewer(QMainWindow):
             self._saved_layout = pdfprefs.read_layout(path)
         except Exception:
             pass
+        self._update_save_state()               # 外で書き換えられた開き方と、いまの表示を比べ直す
         page = self._view.current_page()
         old, self._doc = self._doc, doc
         self._thumbs.set_document(path, doc.pageCount())

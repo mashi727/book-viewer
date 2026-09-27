@@ -5,6 +5,7 @@
   2. PDF を開いて描けるか
   3. 表示したまま開き方を PDF に書き込めるか（pikepdf の同梱、Windows のファイルロック）
   4. 縦書き判定が動くか
+  5. 表示したまま空白ページを挿入できるか
 を確かめる。結果は終了コード（0 = 成功）と、指定したファイルへの 1 行で返す
 （--windowed のバイナリは標準出力を持たないので、ファイルに書く）。
 """
@@ -57,6 +58,10 @@ def run(result_path: str) -> int:
         assert pdfprefs.read_layout(pdf_path).rtl
         assert win._view.page_count() == 3, "reopen failed"
         steps.append(f"layout written while open [{pdfprefs.last_replace_method}]")
+
+        win._insert_blank(index=1, count=1, ref=0)
+        assert win._view.page_count() == 4, f"after insert page_count={win._view.page_count()}"
+        steps.append(f"blank page inserted [{pdfprefs.last_replace_method}]")
 
         win.close()
         Path(result_path).write_text("OK " + " / ".join(steps) + "\n", encoding="utf-8")
