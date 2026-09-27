@@ -12,6 +12,7 @@ PDF にマウスを乗せると表紙のサムネイルが出る。
     → ← Space ホイール クリック … ページ送り（詳細は spread_view.py）
     F / Esc … 全画面 / 解除      ⌘O … フォルダをツリーで開く
     フォルダをクリック … 開閉      ⌘↑ … 親フォルダを選択して閉じる
+    .. … 起動フォルダを 1 つ上へ付け替える（起動フォルダを選択中の ⌘↑ も同じ）
   自動再読込:
     表示中の PDF が書き換えられたら（TeX の再コンパイル等）、書き込みが落ち着くのを
     待って読み込み直す。ページ位置と、ビューア上の開き方は保つ。
@@ -60,6 +61,7 @@ class BookViewer(QMainWindow):
         # 左: 本棚（フォルダツリー）
         self._browser = FileBrowserPanel(Path(self._root), self._store.position)
         self._browser.pdf_clicked.connect(lambda p: self._open_book(str(p)))
+        self._browser.start_dir_changed.connect(lambda p: setattr(self, "_root", str(p)))
         self._browser.reveal(self._root)
 
         # 右: 見開きビュー

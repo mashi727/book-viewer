@@ -1,5 +1,6 @@
 """本棚パネル: Windows エクスプローラーのナビゲーションウィンドウ風のフォルダツリー。
 
+  ..                 （起動フォルダを 1 つ上へ付け替える）
   📁 <起動フォルダ>
   🏠 ホーム
   💻 この Mac
@@ -9,7 +10,8 @@
 フォルダは展開された時点で中身を読む（遅延読み込み）。アイコンは
 QFileIconProvider から取るので Finder と同じ（ドライブの種類ごとに違う）。
 
-  - PDF 以外のファイルと隠しファイルは出さない
+  - PDF 以外のファイルと隠しファイル（名前が . 始まり、または Finder と同じ
+    UF_HIDDEN フラグ付き。/bin・/usr・~/Library など）は出さない
   - 展開済みのフォルダは QFileSystemWatcher で見張り、追加・削除を反映する
   - /Volumes も見張り、ドライブの抜き差しを「この Mac」に反映する
   - 2 列目は読書の進捗（%）。PDF にマウスを乗せると表紙のサムネイルを出す
@@ -19,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import html
 import os
+import stat
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -37,7 +40,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QFont, QHelpEvent, QImage, QPainter
+from PySide6.QtGui import QFont, QHelpEvent, QIcon, QImage, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -144,14 +147,13 @@ class _Tree(QTreeWidget):
             path = item.data(0, _PATH_ROLE) if item else None
             if path and path.lower().endswith(".pdf"):
                 QToolTip.showText(event.globalPos(), self._tooltip(path), self)
-            else:
-                QToolTip.hideText()
-            return True
+                return True
         return super().viewportEvent(event)
 
 
 class FileBrowserPanel(QWidget):
     pdf_clicked = Signal(Path)
+    start_dir_changed = Signal(Path)      # .. で起動フォルダを付け替えたとき
 
     def __init__(
         self,
@@ -217,11 +219,14 @@ class FileBrowserPanel(QWidget):
 
     # ---- API ----
 
-    def reveal(self, path: str | Path) -> bool:
-        """path までツリーを開いて選択する。最も深く一致する最上位項目の下を辿る。"""
+    def reveal(self, path: str | Path, under: QTreeWidgetItem | None = None) -> bool:
+        """path までツリーを開いて選択する。
+
+        under を省くと、path を含む最上位項目のうち最も深いものの下を辿る。
+        """
         target = Path(path)
         best: tuple[int, QTreeWidgetItem] | None = None
-        for item in self._all_roots():
+        for item in [under] if under is not None else self._all_roots():
             p = item.data(0, _PATH_ROLE)
             if p is None:
                 continue
@@ -246,10 +251,28 @@ class FileBrowserPanel(QWidget):
         return True
 
     def select_parent(self) -> None:
+        """⌘↑: 親フォルダを選択して閉じる。起動フォルダ自身なら .. と同じ。"""
         item = self.tree.currentItem()
         if item and item.parent():
             self.tree.setCurrentItem(item.parent())
             item.parent().setExpanded(False)
+        elif item is self._start_item:
+            self.go_up()
+
+    def go_up(self) -> None:
+        """起動フォルダを 1 つ上に付け替え、元のフォルダを開いて選択する。"""
+        old = self._start_dir
+        parent = old.parent
+        if parent == old:
+            return
+        index = self.tree.indexOfTopLevelItem(self._start_item)
+        self.tree.takeTopLevelItem(index)
+        self._start_dir = parent
+        self._start_item = self._make_start_item()
+        self.tree.insertTopLevelItem(index, self._start_item)
+        self._update_up_item()
+        self.reveal(old, under=self._start_item)
+        self.start_dir_changed.emit(parent)
 
     def refresh_progress(self, path: str) -> None:
         for item in self._items_for(path):
@@ -261,17 +284,62 @@ class FileBrowserPanel(QWidget):
     # ---- 構築 ----
 
     def _build_roots(self) -> None:
-        start = self._dir_item(self._start_dir, f"{self._start_dir.name or self._start_dir}")
-        start.setToolTip(0, f"起動フォルダ: {self._start_dir}")
+        up = QTreeWidgetItem(["..", ""])
+        up.setIcon(0, self._up_arrow_icon())
+        up.setData(0, _PATH_ROLE, None)
+        self._up_item = up
+        start = self._start_item = self._make_start_item()
         home = self._dir_item(Path.home(), "ホーム")
         mac = QTreeWidgetItem(["この Mac", ""])
         mac.setIcon(0, self._icons.icon(QFileIconProvider.IconType.Computer))
         mac.setData(0, _PATH_ROLE, None)
         self._mac = mac
-        self.tree.addTopLevelItems([start, home, mac])
+        self.tree.addTopLevelItems([up, start, home, mac])
+        self._update_up_item()
         self._fill_volumes()
+        # 起動フォルダは畳んでおく。展開すると中身で「ホーム」「この Mac」が
+        # 画面外へ押し出され、ただのフォルダ一覧に見えてしまう（Windows と同じく
+        # 最上位の構造が一目で見える状態から始める）
         mac.setExpanded(True)
-        start.setExpanded(True)
+
+    def _up_arrow_icon(self) -> QIcon:
+        """Windows 11 エクスプローラーの「上へ」と同じ、細い線の ↑。
+
+        macOS 標準の「親フォルダへ」(▲) は取り出しボタンに見えるので自前で描く。
+        Windows のグリフ（Segoe Fluent Icons）は使わず、同じ形を線で描く。
+        色はツリーの文字色に合わせる（暗い配色でも見える）。
+        """
+        size = self.tree.iconSize().height()
+        dpr = 2.0
+        pm = QPixmap(round(size * dpr), round(size * dpr))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self.tree.palette().color(QPalette.ColorRole.Text), max(1.5, size / 14))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        cx, top, bottom, wing = size / 2, size * 0.18, size * 0.84, size * 0.30
+        path = QPainterPath()
+        path.moveTo(cx, bottom)
+        path.lineTo(cx, top)                      # 軸
+        path.moveTo(cx - wing, top + wing)
+        path.lineTo(cx, top)                      # 矢じり
+        path.lineTo(cx + wing, top + wing)
+        painter.drawPath(path)
+        painter.end()
+        return QIcon(pm)
+
+    def _make_start_item(self) -> QTreeWidgetItem:
+        item = self._dir_item(self._start_dir, self._start_dir.name or str(self._start_dir))
+        item.setToolTip(0, str(self._start_dir))
+        return item
+
+    def _update_up_item(self) -> None:
+        parent = self._start_dir.parent
+        self._up_item.setHidden(parent == self._start_dir)      # ルートでは出さない
+        self._up_item.setToolTip(0, f"1 つ上へ: {parent}")
 
     def _fill_volumes(self) -> None:
         expanded = self._expanded_paths(self._mac)
@@ -314,6 +382,9 @@ class FileBrowserPanel(QWidget):
                     if e.name.startswith("."):
                         continue
                     try:
+                        # Finder と同じく UF_HIDDEN 付き（/bin・/usr・~/Library 等）も隠す
+                        if e.stat(follow_symlinks=False).st_flags & stat.UF_HIDDEN:
+                            continue
                         if e.is_dir():
                             dirs.append(Path(e.path))
                         elif e.name.lower().endswith(".pdf") and e.is_file():
@@ -416,6 +487,9 @@ class FileBrowserPanel(QWidget):
         return f"{name}<br>{progress}"
 
     def _on_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        if item is self._up_item:
+            self.go_up()
+            return
         path = item.data(0, _PATH_ROLE)
         if path and path.lower().endswith(".pdf") and Path(path).is_file():
             self.pdf_clicked.emit(Path(path))
