@@ -17,7 +17,7 @@
     ページナビゲーション … 最初 / 前 / 次 / 最後のページ、⇧⌘N ページへ移動…
     ページ表示 …… 単一ページ表示 / 見開きページ表示 / 見開きページ表示で表紙を表示
     表示切り替え … F4 ページサムネール、フォルダツリー
-  ツールバーの「見開きページ表示 ▾」… 本体で見開きに切替、▾ で表紙あり / なしを選ぶ
+  ツールバーの［見開きページ表示］［⌄］… 見開きに切替 / ⌄ で表紙あり / なしを選ぶ
     ズーム ……… ⌘+ / ⌘- ズームイン / アウト、⌘0 ページレベルにズーム、⌘1 実際のサイズ、⌘2 幅に合わせる
     ⌘L 全画面モード（Esc で解除）
   読書:
@@ -44,7 +44,21 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QFont, QIntValidator, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QFont,
+    QIcon,
+    QIntValidator,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -77,9 +91,33 @@ _DEFAULT_SIZE = QSize(1920, 1080)   # 既定のウィンドウサイズ（FHD）
 # アプリ内の文字はすべてこの大きさ（macOS の既定は 13pt、ツールバー 10pt、ツールチップ 11pt）。
 # macOS は 1pt = 1 論理 px、Windows は 1pt = 96/72 px なので、Windows の 12pt が macOS の 16pt と同じ 16px になる
 _UI_PT = 12 if sys.platform == "win32" else 16
+_COVER_ARROW_PX = 14         # 表紙あり / なしの ⌄ の幅（高さはその半分）
 _RELOAD_SETTLE_MS = 400      # 書き込みが止んだと見なすまでの待ち
 _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ諦める
 
+
+
+def _chevron_icon(width: int, color: QColor) -> QIcon:
+    """線で描いた ⌄（幅 width、高さ width/2）。Retina でもにじまないよう 2 倍で描く。"""
+    side = width + 4
+    dpr = 2.0
+    pm = QPixmap(round(side * dpr), round(side * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(color, max(1.5, width / 8))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    cx, cy = side / 2, side / 2
+    path = QPainterPath()
+    path.moveTo(cx - width / 2, cy - width / 4)
+    path.lineTo(cx, cy + width / 4)
+    path.lineTo(cx + width / 2, cy - width / 4)
+    painter.drawPath(path)
+    painter.end()
+    return QIcon(pm)
 
 
 def _work_path(book: str) -> Path:
@@ -372,14 +410,19 @@ class BookViewer(QMainWindow):
         tb.addAction(self._act_zoom_in)
         tb.addSeparator()
         tb.addAction(self._act_single)
-        spread_btn = QToolButton()
-        spread_btn.setDefaultAction(self._act_spread)
-        spread_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)   # 本体=切替、▾=表紙の有無
-        cover_menu = QMenu(spread_btn)
+        tb.addAction(self._act_spread)
+        # 表紙あり / なしのメニューは、見開きボタンの右の ⌄ ボタンから（macOS の ▾ は約 6px と小さいので自前で描く）
+        cover_btn = QToolButton()
+        cover_btn.setObjectName("coverMenu")
+        cover_btn.setIcon(_chevron_icon(_COVER_ARROW_PX, self.palette().color(QPalette.ColorRole.ButtonText)))
+        cover_btn.setIconSize(QSize(_COVER_ARROW_PX + 4, _COVER_ARROW_PX + 4))
+        cover_btn.setToolTip("見開きページ表示の表紙あり / なし")
+        cover_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        cover_menu = QMenu(cover_btn)
         cover_menu.setFont(QApplication.font())       # macOS はメニューに小さい文字を割り当てる
         cover_menu.addActions([self._act_cover_on, self._act_cover_off])
-        spread_btn.setMenu(cover_menu)
-        tb.addWidget(spread_btn)
+        cover_btn.setMenu(cover_menu)
+        tb.addWidget(cover_btn)
         tb.addSeparator()
         tb.addAction(self._act_ltr)
         tb.addAction(self._act_rtl)
@@ -393,7 +436,8 @@ class BookViewer(QMainWindow):
             "QToolButton { padding: 2px 6px; }"
             "QToolButton:checked { background: palette(mid); color: palette(text); border-radius: 4px; }"
             "QToolButton:disabled { color: palette(mid); }"
-            'QToolButton[popupMode="1"] { padding-right: 18px; }')
+            "QToolButton#coverMenu { padding: 2px 2px; }"
+            "QToolButton#coverMenu::menu-indicator { image: none; width: 0px; }")   # 自前の ⌄ だけにする
         # ボタンはアクション追加時に作られるので、最後にまとめて文字を大きくする
         font = QApplication.font()
         for w in (tb, self._page_box, self._page_total, self._zoom_box, *tb.findChildren(QToolButton)):
