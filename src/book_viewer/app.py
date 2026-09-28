@@ -34,8 +34,11 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QSize, Qt, QTimer
@@ -65,7 +68,7 @@ from .layout import Layout
 from .insert_dialog import InsertBlankDialog
 from .properties import DocumentPropertiesDialog
 from .spread_view import SpreadView
-from .state import Store, state_dir
+from .state import Store, cache_dir, state_dir
 from .thumbnails import ThumbnailPane
 
 _DEFAULT_SIZE = QSize(1920, 1080)   # 既定のウィンドウサイズ（FHD）。画面が小さければ収まる大きさに縮める
@@ -75,6 +78,23 @@ _UI_PT = 12 if sys.platform == "win32" else 16
 _RELOAD_SETTLE_MS = 400      # 書き込みが止んだと見なすまでの待ち
 _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ諦める
 
+
+
+def _work_path(book: str) -> Path:
+    """未保存の挿入を入れておく作業用コピー（プロセスごと・本ごと）。"""
+    key = hashlib.sha1(book.encode()).hexdigest()[:12]
+    return cache_dir() / "work" / f"{os.getpid()}-{key}.pdf"
+
+
+def _clean_old_work_files(max_age: float = 24 * 3600) -> None:
+    """落ちたり Windows で消せなかったりして残った作業用コピーを掃除する（1 日以上前のもの）。"""
+    now = time.time()
+    for f in (cache_dir() / "work").glob("*.pdf"):
+        try:
+            if now - f.stat().st_mtime > max_age:
+                f.unlink()
+        except OSError:
+            pass
 
 
 def _log_path() -> Path:
@@ -91,6 +111,11 @@ class BookViewer(QMainWindow):
         self._root = str(Path(directory).resolve())
         self._book: str | None = None
         self._saved_layout = Layout()       # PDF に書かれている開き方
+        # 未保存の空白ページの挿入。元の PDF には手を付けず、作業用コピー（_work）に入れて表示し、
+        # ［保存］で元の PDF にまとめて書き込む（Acrobat と同じ）
+        self._work: str | None = None
+        self._pending: list[tuple[int, int, int]] = []
+        _clean_old_work_files()
 
         # 左: 本棚（フォルダツリー）
         self._browser = FileBrowserPanel(Path(self._root), self._store.position, font_size=_UI_PT)
@@ -402,21 +427,30 @@ class BookViewer(QMainWindow):
         self._update_save_state()
 
     def _update_save_state(self) -> None:
-        """いまの表示が PDF に書かれた開き方と違うときだけ保存できる（「保存 •」）。"""
-        dirty = self._book is not None and self._current_layout() != self._saved_layout
+        """保存するものがあるときだけ［保存 •］にする。
+
+        保存するもの = 未保存の空白ページの挿入、または PDF に書かれた開き方と違う表示。
+        ウィンドウの未保存の印（閉じるボタンの点）は、文書の変更（挿入）があるときだけ付ける。
+        """
+        dirty = self._book is not None and (bool(self._pending) or self._current_layout() != self._saved_layout)
         self._act_save.setEnabled(dirty)
         self._act_save.setText("保存 •" if dirty else "保存")
+        self.setWindowModified(bool(self._pending))
 
-    def _save_current(self) -> None:
-        """［保存］・⌘S: いまの表示（ページレイアウト・綴じ方）を PDF に保存する。"""
-        if not self._book or self._current_layout() == self._saved_layout:
-            return
+    def _save_current(self) -> bool:
+        """［保存］・⌘S: 未保存の挿入と、いまの表示（ページレイアウト・綴じ方）を PDF に書き込む。"""
+        if not self._book:
+            return True
+        layout = self._current_layout()
+        if layout == self._saved_layout and not self._pending:
+            return True
         try:
-            self._write_layout(self._current_layout())
+            self._write_layout(layout)
         except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
             QMessageBox.warning(self, "PDF に保存できませんでした", f"{Path(self._book).name}\n\n{e}")
-            return
-        self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
+            return False
+        self.statusBar().showMessage("PDF に保存しました", 3000)
+        return True
 
     def _set_cover(self, cover: bool) -> None:
         """プルダウンで表紙の有無を選んだ。見開きでなければ見開きにする。"""
@@ -434,29 +468,83 @@ class BookViewer(QMainWindow):
         dlg = DocumentPropertiesDialog(self._book, self._view.page_count(), self._current_layout(), self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        layout = dlg.result_layout()
-        if layout == self._saved_layout:
-            return
-        try:
-            self._write_layout(layout)
-        except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
-            QMessageBox.warning(self, "PDF に保存できませんでした", f"{Path(self._book).name}\n\n{e}")
-            return
-        self.statusBar().showMessage("開き方を PDF に書き込みました", 3000)
+        # OK はその場で保存する（未保存の空白ページの挿入も一緒に書き込む）
+        self._apply_layout(dlg.result_layout())
+        self._save_current()
 
     def _write_layout(self, layout: Layout) -> None:
-        """開き方を PDF に書き込み、表示に反映する。"""
-        self._modify_pdf(lambda path: pdfprefs.write_layout(path, layout, log_path=_log_path()))
+        """未保存の挿入と開き方を元の PDF に 1 回で書き込み、元の PDF を開き直して表示に反映する。"""
+        book = self._book
+        if not book:
+            return
+        inserts = list(self._pending)
+        new_layout = layout if layout != self._saved_layout else None   # 変えていない開き方は書かない
+        self._modify_pdf(
+            lambda path: pdfprefs.apply_edits(path, inserts, new_layout, log_path=_log_path()),
+            target=book, show=book)
+        self._discard_work()
         self._saved_layout = layout
         self._apply_layout(layout)
 
     def _insert_blank(self, index: int, count: int, ref: int) -> None:
-        """空白ページを挿入する。挿入位置より後ろを読んでいたら、同じ内容のページを見せ続ける。"""
-        self._modify_pdf(
-            lambda path: pdfprefs.insert_blank_pages(path, index, count, ref, log_path=_log_path()),
-            page_after=lambda page: page + count if index <= page else page,
-        )
-        self.statusBar().showMessage(f"空白ページを {count} 枚挿入しました（{index + 1} ページ目から）", 5000)
+        """空白ページを挿入する（未保存。作業用コピーに入れて表示する）。
+
+        挿入位置より後ろを読んでいたら、同じ内容のページを見せ続ける。
+        """
+        book = self._book
+        if not book:
+            return
+        work = self._work
+        if work is None:
+            work = str(_work_path(book))
+            Path(work).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(book, work)
+        try:
+            self._modify_pdf(
+                lambda path: pdfprefs.insert_blank_pages(path, index, count, ref),
+                target=work, show=work,
+                page_after=lambda page: page + count if index <= page else page,
+            )
+        except Exception:
+            if self._work is None:
+                Path(work).unlink(missing_ok=True)
+            raise
+        self._work = work
+        self._pending.append((index, count, ref))
+        self._update_save_state()
+        self.statusBar().showMessage(
+            f"空白ページを {count} 枚挿入しました（{index + 1} ページ目から。［保存］で PDF に書き込みます）", 8000)
+
+    def _discard_work(self) -> None:
+        """未保存の挿入を捨てる（作業用コピーを消す）。"""
+        if self._work:
+            try:
+                Path(self._work).unlink(missing_ok=True)
+            except OSError:
+                pass                      # Windows で開いたまま等。起動時の掃除で消える
+        self._work = None
+        self._pending = []
+        self._update_save_state()
+
+    def _confirm_discard(self) -> bool:
+        """未保存の挿入があれば「保存しますか？」と聞く。続けてよければ True。"""
+        if not self._pending or not self._book:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"「{Path(self._book).name}」への変更を保存しますか？")
+        box.setInformativeText("空白ページの挿入が保存されていません。保存しないと失われます。")
+        save = box.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
+        discard = box.addButton("保存しない", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save)
+        box.exec()
+        if box.clickedButton() is save:
+            return self._save_current()
+        if box.clickedButton() is discard:
+            self._discard_work()
+            return True
+        return False
 
     def _show_insert_blank(self, page: int | None = None) -> None:
         if not self._book:
@@ -464,7 +552,7 @@ class BookViewer(QMainWindow):
         book = self._book
         dlg = InsertBlankDialog(self._view.page_count(),
                                 self._view.current_page() if page is None else page,
-                                lambda p: pdfprefs.page_size_mm(book, p), self)
+                                lambda p: pdfprefs.page_size_mm(self._work or book, p), self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         index, count, ref = dlg.insertion()
@@ -473,25 +561,26 @@ class BookViewer(QMainWindow):
         except Exception as e:  # 暗号化 PDF・壊れた PDF・書き込み不可など
             QMessageBox.warning(self, "空白ページを挿入できませんでした", f"{Path(book).name}\n\n{e}")
 
-    def _modify_pdf(self, write, page_after=lambda page: page) -> None:
-        """表示中の PDF を書き換えて開き直す（開き方の保存・空白ページの挿入で共通）。
+    def _modify_pdf(self, write, target: str, show: str, page_after=lambda page: page) -> None:
+        """target を書き換え、show を開き直して表示する（保存・空白ページの挿入で共通）。
+
+        書き込みに失敗したら、それまで表示していたもの（作業用コピーか元の PDF）を開き直す。
 
         Windows では開いているファイルを置き換えられない（os.replace が WinError 5）。
         ページビューとサムネイルのスレッドが PDF を開いたままなので、書き込みの間だけ
         両方を閉じ、終わったら（失敗しても）開き直す。書き込みは同期処理で、その間に
         再描画は走らないので画面はちらつかない。
         """
-        path = self._book
-        if not path:
-            return
         page = self._view.current_page()
+        before = self._work or self._book
         self._thumbs.release_file()
         self._doc.close()
         ok = False
         try:
-            write(path)
+            write(target)
             ok = True
         finally:
+            path = show if ok else before
             if ok:
                 page = page_after(page)
             doc = QPdfDocument(self)
@@ -500,9 +589,10 @@ class BookViewer(QMainWindow):
             self._thumbs.set_document(path, doc.pageCount())
             self._view.set_document(doc, page)
             old.deleteLater()
-            self._loaded_sig = self._file_sig(path)     # 自分の書き込みで再読込が走らないように
-            if path not in self._file_watcher.files():
-                self._file_watcher.addPath(path)
+            if self._book:
+                self._loaded_sig = self._file_sig(self._book)   # 自分の書き込みで再読込が走らないように
+                if self._book not in self._file_watcher.files():
+                    self._file_watcher.addPath(self._book)
 
     # ---- ズーム ----
 
@@ -598,7 +688,10 @@ class BookViewer(QMainWindow):
         if path == self._book:
             self._view.setFocus()
             return
+        if not self._confirm_discard():
+            return
         self._save_position()
+        self._discard_work()
         doc = QPdfDocument(self)
         if doc.load(path) != QPdfDocument.Error.None_:
             self.statusBar().showMessage(f"開けませんでした: {Path(path).name}", 5000)
@@ -628,14 +721,15 @@ class BookViewer(QMainWindow):
         old.deleteLater()
         self._file_watcher.addPath(path)
         self._loaded_sig = self._file_sig(path)
-        self.setWindowTitle(f"{Path(path).stem} — Book Viewer")
+        self.setWindowTitle(f"{Path(path).stem}[*] — Book Viewer")
+        self._update_save_state()
         if guessed == "rtl":
             self.statusBar().showMessage(
                 "本文が縦書きなので右綴じで表示しています（⌘D の綴じ方で PDF に保存できます）", 8000)
         self._view.setFocus()
 
     def _close_book(self) -> None:
-        if not self._book:
+        if not self._book or not self._confirm_discard():
             return
         self._save_position()
         self._file_watcher.removePath(self._book)
@@ -644,6 +738,7 @@ class BookViewer(QMainWindow):
         self._view.set_document(None)
         self._doc.deleteLater()
         self._doc = QPdfDocument(self)
+        self._discard_work()
         self.setWindowTitle("Book Viewer")
         self._update_save_state()
 
@@ -776,9 +871,18 @@ class BookViewer(QMainWindow):
         old.deleteLater()
         self._loaded_sig = sig
         self._browser.forget_thumbnail(path)
-        self.statusBar().showMessage(f"再読み込みしました（{doc.pageCount()} ページ）", 3000)
+        if self._work:
+            # 未保存の挿入は古い版に対するものなので捨てる
+            self._discard_work()
+            self.statusBar().showMessage(
+                "元の PDF が更新されたので読み込み直しました（未保存の空白ページの挿入は取り消しました）", 8000)
+        else:
+            self.statusBar().showMessage(f"再読み込みしました（{doc.pageCount()} ページ）", 3000)
 
     def closeEvent(self, event) -> None:
+        if not self._confirm_discard():
+            event.ignore()
+            return
         self._save_position()
         self._store.save()                      # ズームの倍率など
         self._thumbs.shutdown()

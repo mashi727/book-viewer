@@ -120,3 +120,19 @@ def test_insert_blank_rejects_out_of_range(tmp_path):
     with pikepdf.open(p) as pdf:
         assert len(pdf.pages) == 1
     assert not list(tmp_path.glob(".*tmp"))
+
+
+def test_apply_edits_multiple_inserts_and_layout_in_one_write(tmp_path):
+    from book_viewer.pdfprefs import apply_edits
+    p = tmp_path / "a.pdf"
+    log = tmp_path / "log.jsonl"
+    _pdf_with_sizes(p, [(420, 595)] * 4)
+    # 2 ページ目の後に 1 枚 → その結果の先頭に 2 枚（あとの挿入は前の挿入後のページ番号で数える）
+    apply_edits(p, inserts=[(2, 1, 1), (0, 2, 0)], layout=Layout(True, True, True), log_path=log)
+    with pikepdf.open(p) as pdf:
+        assert len(pdf.pages) == 7
+        blank = [i for i, pg in enumerate(pdf.pages) if pg.obj.Contents.read_bytes() == b""]
+        assert blank == [0, 1, 4]
+    assert read_layout(p) == Layout(True, True, True)
+    lines = log.read_text().splitlines()
+    assert len(lines) == 1 and json.loads(lines[0])["action"] == "edits"   # 1 回の書き込みで 1 行

@@ -59,9 +59,16 @@ def run(result_path: str) -> int:
         assert win._view.page_count() == 3, "reopen failed"
         steps.append(f"layout written while open [{pdfprefs.last_replace_method}]")
 
+        # 空白ページの挿入は未保存（作業用コピーに入る）→［保存］で元の PDF に書き込む
         win._insert_blank(index=1, count=1, ref=0)
         assert win._view.page_count() == 4, f"after insert page_count={win._view.page_count()}"
-        steps.append(f"blank page inserted [{pdfprefs.last_replace_method}]")
+        with pikepdf.open(pdf_path) as chk:
+            assert len(chk.pages) == 3, "insert must not touch the original before saving"
+        assert win._save_current()
+        with pikepdf.open(pdf_path) as chk:
+            assert len(chk.pages) == 4, f"after save pages={len(chk.pages)}"
+        assert not win._pending and win._work is None
+        steps.append(f"blank page inserted and saved [{pdfprefs.last_replace_method}]")
 
         win.close()
         Path(result_path).write_text("OK " + " / ".join(steps) + "\n", encoding="utf-8")

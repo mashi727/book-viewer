@@ -136,36 +136,6 @@ def _rewrite(path: str | os.PathLike, mutate, verify, log_path: Path | None) -> 
             tmp.unlink(missing_ok=True)
 
 
-def write_layout(path: str | os.PathLike, layout: Layout, log_path: Path | None = None) -> None:
-    """開き方を PDF に書き込む。"""
-    page_layout = (
-        ("/TwoPageRight" if layout.cover_single else "/TwoPageLeft")
-        if layout.spread
-        else "/SinglePage"
-    )
-    direction = "/R2L" if layout.rtl else "/L2R"
-    new = {"PageLayout": page_layout, "Direction": direction}
-    n_pages = 0
-
-    def mutate(pdf: pikepdf.Pdf) -> dict:
-        nonlocal n_pages
-        old = _raw(pdf)
-        n_pages = len(pdf.pages)
-        pdf.Root.PageLayout = pikepdf.Name(page_layout)
-        vp = pdf.Root.get("/ViewerPreferences")
-        if not isinstance(vp, pikepdf.Dictionary):
-            pdf.Root.ViewerPreferences = pikepdf.Dictionary()
-        pdf.Root.ViewerPreferences.Direction = pikepdf.Name(direction)
-        return {"action": "layout", "old": old, "new": new}
-
-    def verify(chk: pikepdf.Pdf) -> None:
-        got = _raw(chk)
-        if len(chk.pages) != n_pages or got != new:
-            raise RuntimeError(f"書き込み検証に失敗: pages={len(chk.pages)}/{n_pages} {got}")
-
-    _rewrite(path, mutate, verify, log_path)
-
-
 def _inherited(page: pikepdf.Dictionary, key: str):
     """ページ属性を親の /Pages から継承して引く（/Rotate などはページ木の上に書かれることがある）。"""
     node = page
@@ -190,49 +160,98 @@ def page_size_mm(path: str | os.PathLike, index: int) -> tuple[float, float]:
         return w * 25.4 / 72, h * 25.4 / 72
 
 
-def insert_blank_pages(path: str | os.PathLike, index: int, count: int = 1,
-                       ref: int | None = None, log_path: Path | None = None) -> None:
-    """index（0 始まり。0 なら先頭、ページ数なら末尾）の位置に空白ページを count 枚挿入する。
+def _layout_values(layout: Layout) -> dict[str, str]:
+    page_layout = (
+        ("/TwoPageRight" if layout.cover_single else "/TwoPageLeft")
+        if layout.spread
+        else "/SinglePage"
+    )
+    return {"PageLayout": page_layout, "Direction": "/R2L" if layout.rtl else "/L2R"}
 
-    大きさ・向きは ref ページ（省略時は直前のページ、先頭なら 1 ページ目）に揃える。
-    """
+
+def _set_layout(pdf: pikepdf.Pdf, layout: Layout) -> dict:
+    old = _raw(pdf)
+    new = _layout_values(layout)
+    pdf.Root.PageLayout = pikepdf.Name(new["PageLayout"])
+    vp = pdf.Root.get("/ViewerPreferences")
+    if not isinstance(vp, pikepdf.Dictionary):
+        pdf.Root.ViewerPreferences = pikepdf.Dictionary()
+    pdf.Root.ViewerPreferences.Direction = pikepdf.Name(new["Direction"])
+    return {"action": "layout", "old": old, "new": new}
+
+
+def _insert_blank(pdf: pikepdf.Pdf, index: int, count: int, ref: int | None) -> dict:
+    """index の位置に空白ページを count 枚。大きさ・向きは ref ページ（省略時は直前、先頭なら 1 ページ目）に揃える。"""
     if count < 1:
         raise ValueError("count must be >= 1")
+    n_pages = len(pdf.pages)
+    if not 0 <= index <= n_pages:
+        raise ValueError(f"挿入位置が範囲外です: {index}（0〜{n_pages}）")
+    r = ref if ref is not None else max(0, index - 1)
+    src = pdf.pages[r]
+    media = pikepdf.Array([float(v) for v in src.mediabox])
+    crop = pikepdf.Array([float(v) for v in src.cropbox])
+    rotate = _inherited(src.obj, "/Rotate")
+    unit = _inherited(src.obj, "/UserUnit")
+    for _ in range(count):
+        d = pikepdf.Dictionary(
+            Type=pikepdf.Name.Page,
+            MediaBox=media,
+            Resources=pikepdf.Dictionary(),
+            Contents=pdf.make_stream(b""),
+        )
+        if list(crop) != list(media):
+            d.CropBox = crop
+        if rotate is not None:
+            d.Rotate = rotate
+        if unit is not None:
+            d.UserUnit = unit
+        pdf.pages.insert(index, pikepdf.Page(pdf.make_indirect(d)))
+    return {"action": "insert_blank", "index": index, "count": count, "ref": r, "pages_before": n_pages}
+
+
+def apply_edits(path: str | os.PathLike, inserts: list[tuple[int, int, int | None]] = (),
+                layout: Layout | None = None, log_path: Path | None = None) -> None:
+    """空白ページの挿入（(index, count, ref) を順に）と開き方を、1 回の書き込みでまとめて行う。
+
+    ［保存］でたまった変更を書くときに使う。検証はページ数・挿入したページが空であること・開き方の値。
+    """
+    inserts = list(inserts)
     n_pages = 0
+    blanks: list[int] = []          # 挿入後の、空白ページの位置
 
     def mutate(pdf: pikepdf.Pdf) -> dict:
         nonlocal n_pages
         n_pages = len(pdf.pages)
-        if not 0 <= index <= n_pages:
-            raise ValueError(f"挿入位置が範囲外です: {index}（0〜{n_pages}）")
-        r = ref if ref is not None else max(0, index - 1)
-        src = pdf.pages[r]
-        media = pikepdf.Array([float(v) for v in src.mediabox])
-        crop = pikepdf.Array([float(v) for v in src.cropbox])
-        rotate = _inherited(src.obj, "/Rotate")
-        unit = _inherited(src.obj, "/UserUnit")
-        for _ in range(count):
-            d = pikepdf.Dictionary(
-                Type=pikepdf.Name.Page,
-                MediaBox=media,
-                Resources=pikepdf.Dictionary(),
-                Contents=pdf.make_stream(b""),
-            )
-            if list(crop) != list(media):
-                d.CropBox = crop
-            if rotate is not None:
-                d.Rotate = rotate
-            if unit is not None:
-                d.UserUnit = unit
-            pdf.pages.insert(index, pikepdf.Page(pdf.make_indirect(d)))
-        return {"action": "insert_blank", "index": index, "count": count, "ref": r,
-                "pages_before": n_pages}
+        steps = []
+        for index, count, ref in inserts:
+            steps.append(_insert_blank(pdf, index, count, ref))
+            blanks[:] = [b + count if b >= index else b for b in blanks] + list(range(index, index + count))
+        if layout is not None:
+            steps.append(_set_layout(pdf, layout))
+        if len(steps) == 1:
+            return steps[0]
+        return {"action": "edits", "steps": steps}
 
     def verify(chk: pikepdf.Pdf) -> None:
-        if len(chk.pages) != n_pages + count:
-            raise RuntimeError(f"書き込み検証に失敗: pages={len(chk.pages)}（期待 {n_pages + count}）")
-        for i in range(index, index + count):
-            if chk.pages[i].obj.Contents.read_bytes():
-                raise RuntimeError(f"書き込み検証に失敗: {i + 1} ページ目が空白ではありません")
+        added = sum(c for _i, c, _r in inserts)
+        if len(chk.pages) != n_pages + added:
+            raise RuntimeError(f"書き込み検証に失敗: pages={len(chk.pages)}（期待 {n_pages + added}）")
+        for b in blanks:
+            if chk.pages[b].obj.Contents.read_bytes():
+                raise RuntimeError(f"書き込み検証に失敗: {b + 1} ページ目が空白ではありません")
+        if layout is not None and _raw(chk) != _layout_values(layout):
+            raise RuntimeError(f"書き込み検証に失敗: {_raw(chk)}")
 
     _rewrite(path, mutate, verify, log_path)
+
+
+def write_layout(path: str | os.PathLike, layout: Layout, log_path: Path | None = None) -> None:
+    """開き方を PDF に書き込む。"""
+    apply_edits(path, layout=layout, log_path=log_path)
+
+
+def insert_blank_pages(path: str | os.PathLike, index: int, count: int = 1,
+                       ref: int | None = None, log_path: Path | None = None) -> None:
+    """index（0 始まり。0 なら先頭、ページ数なら末尾）の位置に空白ページを count 枚挿入する。"""
+    apply_edits(path, inserts=[(index, count, ref)], log_path=log_path)
