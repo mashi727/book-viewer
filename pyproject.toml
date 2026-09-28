@@ -1,7 +1,7 @@
 [project]
 name = "book-viewer"
-version = "0.3.0"
-description = "自炊本PDFリーダー（見開き・右綴じ・表紙単独を PDF に書き込み、読書位置を記憶、更新を自動再読込）"
+version = "0.4.0"
+description = "自炊本PDFリーダー（開き方を PDF に保存、ページの挿入・並べ替え、ファイル名検索、読書位置の記憶、更新を自動再読込）"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

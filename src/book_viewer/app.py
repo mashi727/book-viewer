@@ -28,7 +28,7 @@
     .. … 起動フォルダを 1 つ上へ付け替える（起動フォルダを選択中の ⌘↑ も同じ）
   開き方の保存:
     ⌘D の「開き方 › ページレイアウト」と「詳細設定 › 綴じ方」を OK で PDF に書き込む。
-    ツールバー（単一 / 見開き▾ / 左綴じ / 右綴じ）と表示メニューでも同じ項目を切り替えられ、
+    ツールバー（単一 / 見開き / ⌄ 表紙あり・なし / 左綴じ / 右綴じ）と表示メニューでも同じ項目を切り替えられ、
     ［保存］か ⌘S でいまの表示を PDF に書き込む。PDF と違う表示のときだけ［保存 •］になる
   自動再読込:
     表示中の PDF が書き換えられたら（TeX の再コンパイル等）、書き込みが落ち着くのを
@@ -97,9 +97,8 @@ _RELOAD_MAX_TRIES = 50       # 400ms × 50 ≒ 20 秒待って読めなければ
 
 
 
-def _chevron_icon(width: int, color: QColor) -> QIcon:
-    """線で描いた ⌄（幅 width、高さ width/2）。Retina でもにじまないよう 2 倍で描く。"""
-    side = width + 4
+def _chevron_icon(width: int, color: QColor, side: int) -> QIcon:
+    """side 四方の画像の中央に、線で描いた ⌄（幅 width、高さ width/2）。Retina でもにじまないよう 2 倍で描く。"""
     dpr = 2.0
     pm = QPixmap(round(side * dpr), round(side * dpr))
     pm.setDevicePixelRatio(dpr)
@@ -296,7 +295,7 @@ class BookViewer(QMainWindow):
         self._act_single.setChecked(True)
         self._act_cover = A("見開きページ表示で表紙を表示", None, self._on_view_layout_changed, checkable=True)
         self._act_cover.setChecked(True)
-        # ツールバーの「見開きページ表示 ▾」のプルダウン。表示メニューのチェックと同じ状態を持つ
+        # ツールバーの ⌄（表紙あり / なし）のメニュー。表示メニューのチェックと同じ状態を持つ
         self._act_cover_on = A("見開きページ（表紙あり）", None, lambda on: self._set_cover(True),
                                checkable=True, tip="1 ページ目（表紙）を単独で表示する")
         self._act_cover_off = A("見開きページ（表紙なし）", None, lambda on: self._set_cover(False),
@@ -414,8 +413,11 @@ class BookViewer(QMainWindow):
         # 表紙あり / なしのメニューは、見開きボタンの右の ⌄ ボタンから（macOS の ▾ は約 6px と小さいので自前で描く）
         cover_btn = QToolButton()
         cover_btn.setObjectName("coverMenu")
-        cover_btn.setIcon(_chevron_icon(_COVER_ARROW_PX, self.palette().color(QPalette.ColorRole.ButtonText)))
-        cover_btn.setIconSize(QSize(_COVER_ARROW_PX + 4, _COVER_ARROW_PX + 4))
+        # ツールバーはボタンのアイコンを自分のアイコンの大きさ（macOS は 32px）に引き伸ばすので、
+        # その大きさの画像の中央に幅 _COVER_ARROW_PX の ⌄ を描く（拡大されず、指定どおりの幅になる）
+        side = max(tb.iconSize().height(), _COVER_ARROW_PX + 4)
+        cover_btn.setIcon(_chevron_icon(_COVER_ARROW_PX, self.palette().color(QPalette.ColorRole.ButtonText), side))
+        cover_btn.setIconSize(QSize(side, side))
         cover_btn.setToolTip("見開きページ表示の表紙あり / なし")
         cover_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         cover_menu = QMenu(cover_btn)
@@ -431,7 +433,7 @@ class BookViewer(QMainWindow):
 
         # macOS の既定では「選択中」のボタンの文字が薄く、押せない（無効）ボタンと見分けにくい。
         # 選択中は灰色の背景に通常の文字色（アクセント色はウィンドウが非アクティブだと淡くなり
-        # 白い文字が読みにくい）。無効は薄い文字。▾ 付きのボタンは ▾ の分の余白を取る
+        # 白い文字が読みにくい）。無効は薄い文字。⌄ ボタンは macOS の ▾ を消して自前の ⌄ だけにする
         tb.setStyleSheet(
             "QToolButton { padding: 2px 6px; }"
             "QToolButton:checked { background: palette(mid); color: palette(text); border-radius: 4px; }"

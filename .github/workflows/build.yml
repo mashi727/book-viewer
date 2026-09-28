@@ -69,6 +69,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      # CHANGELOG.md の「## <タグ> 」の節を Release の本文にする
+      - name: Release notes
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" 'index($0, "## " tag " ") == 1 {f=1; next} /^## / && f {exit} f' CHANGELOG.md > notes.md
+          cat notes.md
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -76,3 +82,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          body_path: notes.md
