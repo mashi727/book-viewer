@@ -17,6 +17,7 @@ PDF 標準（ISO 32000）のカタログ項目を使うので、プレビュー�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -210,36 +211,70 @@ def _insert_blank(pdf: pikepdf.Pdf, index: int, count: int, ref: int | None) -> 
     return {"action": "insert_blank", "index": index, "count": count, "ref": r, "pages_before": n_pages}
 
 
-def apply_edits(path: str | os.PathLike, inserts: list[tuple[int, int, int | None]] = (),
-                layout: Layout | None = None, log_path: Path | None = None) -> None:
-    """空白ページの挿入（(index, count, ref) を順に）と開き方を、1 回の書き込みでまとめて行う。
+def move_order(n: int, rows: list[int], dest: int) -> list[int]:
+    """rows（元の位置、順不同）を dest（元の並びで数えた挿入位置 0〜n）へ移した後の並び（元の位置の列）。
 
-    ［保存］でたまった変更を書くときに使う。検証はページ数・挿入したページが空であること・開き方の値。
+    離れたページをまとめて動かしても、選んだページどうしの順序は元のまま保つ。
     """
-    inserts = list(inserts)
-    n_pages = 0
-    blanks: list[int] = []          # 挿入後の、空白ページの位置
+    moving = sorted(set(rows))
+    rest = [i for i in range(n) if i not in set(moving)]
+    k = dest - sum(1 for r in moving if r < dest)
+    return rest[:k] + moving + rest[k:]
+
+
+def _page_key(page: pikepdf.Page) -> str:
+    """ページの同一性の目印（内容ストリームと MediaBox のハッシュ）。並べ替えの検証に使う。"""
+    h = hashlib.sha1()
+    contents = page.obj.get("/Contents")
+    streams = contents if isinstance(contents, pikepdf.Array) else [contents] if contents is not None else []
+    for st in streams:
+        h.update(st.read_raw_bytes())
+    h.update(repr([float(v) for v in page.mediabox]).encode())
+    return h.hexdigest()
+
+
+def apply_edits(path: str | os.PathLike, ops: list[tuple] = (),
+                layout: Layout | None = None, log_path: Path | None = None) -> None:
+    """ページの編集を順に適用し、開き方も含めて 1 回の書き込みで行う（［保存］でたまった変更を書く）。
+
+      ("insert", index, count, ref) … index の位置に空白ページを count 枚（大きさは ref ページ）
+      ("move", rows, dest)          … rows のページを dest（その時点の並びで数えた挿入位置）へ
+
+    検証: 各ページの中身（_page_key）が、意図した順序どおりに並んでいること。
+    """
+    ops = [tuple(op) for op in ops]
+    expected: list[str] = []
 
     def mutate(pdf: pikepdf.Pdf) -> dict:
-        nonlocal n_pages
-        n_pages = len(pdf.pages)
+        keys = [_page_key(pg) for pg in pdf.pages]
         steps = []
-        for index, count, ref in inserts:
-            steps.append(_insert_blank(pdf, index, count, ref))
-            blanks[:] = [b + count if b >= index else b for b in blanks] + list(range(index, index + count))
+        for op in ops:
+            if op[0] == "insert":
+                _kind, index, count, ref = op
+                steps.append(_insert_blank(pdf, index, count, ref))
+                keys[index:index] = [_page_key(pdf.pages[i]) for i in range(index, index + count)]
+            elif op[0] == "move":
+                _kind, rows, dest = op
+                n = len(pdf.pages)
+                if not rows or any(not 0 <= r < n for r in rows) or not 0 <= dest <= n:
+                    raise ValueError(f"移動の指定が範囲外です: {rows} → {dest}（0〜{n}）")
+                order = move_order(n, list(rows), dest)
+                pdf.pages[:] = [pdf.pages[i] for i in order]
+                keys = [keys[i] for i in order]
+                steps.append({"action": "move", "rows": sorted(set(rows)), "dest": dest, "pages": n})
+            else:
+                raise ValueError(f"unknown op: {op[0]}")
         if layout is not None:
             steps.append(_set_layout(pdf, layout))
-        if len(steps) == 1:
-            return steps[0]
-        return {"action": "edits", "steps": steps}
+        expected[:] = keys
+        return steps[0] if len(steps) == 1 else {"action": "edits", "steps": steps}
 
     def verify(chk: pikepdf.Pdf) -> None:
-        added = sum(c for _i, c, _r in inserts)
-        if len(chk.pages) != n_pages + added:
-            raise RuntimeError(f"書き込み検証に失敗: pages={len(chk.pages)}（期待 {n_pages + added}）")
-        for b in blanks:
-            if chk.pages[b].obj.Contents.read_bytes():
-                raise RuntimeError(f"書き込み検証に失敗: {b + 1} ページ目が空白ではありません")
+        got = [_page_key(pg) for pg in chk.pages]
+        if got != expected:
+            bad = next((i for i, (a, b) in enumerate(zip(got, expected)) if a != b), min(len(got), len(expected)))
+            raise RuntimeError(f"書き込み検証に失敗: {bad + 1} ページ目が意図した内容ではありません"
+                               f"（ページ数 {len(got)} / 期待 {len(expected)}）")
         if layout is not None and _raw(chk) != _layout_values(layout):
             raise RuntimeError(f"書き込み検証に失敗: {_raw(chk)}")
 
@@ -254,4 +289,4 @@ def write_layout(path: str | os.PathLike, layout: Layout, log_path: Path | None 
 def insert_blank_pages(path: str | os.PathLike, index: int, count: int = 1,
                        ref: int | None = None, log_path: Path | None = None) -> None:
     """index（0 始まり。0 なら先頭、ページ数なら末尾）の位置に空白ページを count 枚挿入する。"""
-    apply_edits(path, inserts=[(index, count, ref)], log_path=log_path)
+    apply_edits(path, [("insert", index, count, ref)], log_path=log_path)

@@ -11,6 +11,8 @@
     ⇧⌘F ファイル名を検索…（起動フォルダ以下、サブフォルダも含む。Esc で消す）
   文書:
     ⇧⌘T 空白ページを挿入…（基準ページと同じ大きさ。サムネールの右クリックからも）
+    ページの移動 … サムネールを ⇧ / ⌘ で複数選択してドラッグ
+    挿入・移動は未保存の変更になり、［保存］でまとめて PDF に書き込む
   表示:
     ページナビゲーション … 最初 / 前 / 次 / 最後のページ、⇧⌘N ページへ移動…
     ページ表示 …… 単一ページ表示 / 見開きページ表示 / 見開きページ表示で表紙を表示
@@ -111,10 +113,11 @@ class BookViewer(QMainWindow):
         self._root = str(Path(directory).resolve())
         self._book: str | None = None
         self._saved_layout = Layout()       # PDF に書かれている開き方
-        # 未保存の空白ページの挿入。元の PDF には手を付けず、作業用コピー（_work）に入れて表示し、
-        # ［保存］で元の PDF にまとめて書き込む（Acrobat と同じ）
+        # 未保存のページの編集（空白ページの挿入・ページの移動）。元の PDF には手を付けず、
+        # 作業用コピー（_work）に入れて表示し、［保存］で元の PDF にまとめて書き込む（Acrobat と同じ）。
+        # 要素は pdfprefs.apply_edits の操作 ("insert", index, count, ref) / ("move", rows, dest)
         self._work: str | None = None
-        self._pending: list[tuple[int, int, int]] = []
+        self._pending: list[tuple] = []
         _clean_old_work_files()
 
         # 左: 本棚（フォルダツリー）
@@ -129,6 +132,7 @@ class BookViewer(QMainWindow):
         self._thumbs.page_clicked.connect(lambda page: self._view.go_to_page(page))
         self._thumbs.close_requested.connect(lambda: self._set_thumbs_visible(False))
         self._thumbs.insert_blank_requested.connect(self._show_insert_blank)
+        self._thumbs.move_requested.connect(self._move_pages)
 
         # 右: ページ
         self._doc = QPdfDocument(self)
@@ -477,19 +481,19 @@ class BookViewer(QMainWindow):
         book = self._book
         if not book:
             return
-        inserts = list(self._pending)
+        ops = list(self._pending)
         new_layout = layout if layout != self._saved_layout else None   # 変えていない開き方は書かない
         self._modify_pdf(
-            lambda path: pdfprefs.apply_edits(path, inserts, new_layout, log_path=_log_path()),
+            lambda path: pdfprefs.apply_edits(path, ops, new_layout, log_path=_log_path()),
             target=book, show=book)
         self._discard_work()
         self._saved_layout = layout
         self._apply_layout(layout)
 
-    def _insert_blank(self, index: int, count: int, ref: int) -> None:
-        """空白ページを挿入する（未保存。作業用コピーに入れて表示する）。
+    def _edit(self, op: tuple, page_after) -> None:
+        """ページの編集を作業用コピーに適用して表示する（未保存。［保存］で元の PDF に書き込む）。
 
-        挿入位置より後ろを読んでいたら、同じ内容のページを見せ続ける。
+        page_after: 編集前に表示していたページ → 編集後の同じ内容のページ。
         """
         book = self._book
         if not book:
@@ -500,20 +504,39 @@ class BookViewer(QMainWindow):
             Path(work).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(book, work)
         try:
-            self._modify_pdf(
-                lambda path: pdfprefs.insert_blank_pages(path, index, count, ref),
-                target=work, show=work,
-                page_after=lambda page: page + count if index <= page else page,
-            )
+            self._modify_pdf(lambda path: pdfprefs.apply_edits(path, [op]),
+                             target=work, show=work, page_after=page_after)
         except Exception:
             if self._work is None:
                 Path(work).unlink(missing_ok=True)
             raise
         self._work = work
-        self._pending.append((index, count, ref))
+        self._pending.append(op)
         self._update_save_state()
+
+    def _insert_blank(self, index: int, count: int, ref: int) -> None:
+        """空白ページを挿入する。挿入位置より後ろを読んでいたら、同じ内容のページを見せ続ける。"""
+        self._edit(("insert", index, count, ref),
+                   page_after=lambda page: page + count if index <= page else page)
         self.statusBar().showMessage(
             f"空白ページを {count} 枚挿入しました（{index + 1} ページ目から。［保存］で PDF に書き込みます）", 8000)
+
+    def _move_pages(self, rows: list, dest: int) -> None:
+        """サムネイルのドラッグ: rows のページを dest の位置へ移す。移したページを選んだままにする。"""
+        n = self._view.page_count()
+        order = pdfprefs.move_order(n, rows, dest)
+        if order == list(range(n)):
+            return                                  # 自分の位置に落とした
+        new_pos = {old: new for new, old in enumerate(order)}
+        try:
+            self._edit(("move", sorted(rows), dest), page_after=lambda page: new_pos.get(page, page))
+        except Exception as e:
+            QMessageBox.warning(self, "ページを移動できませんでした", str(e))
+            return
+        self._thumbs.select_pages(sorted(new_pos[r] for r in rows))
+        first = min(new_pos[r] for r in rows) + 1
+        self.statusBar().showMessage(
+            f"{len(rows)} ページを移動しました（{first} ページ目へ。［保存］で PDF に書き込みます）", 8000)
 
     def _discard_work(self) -> None:
         """未保存の挿入を捨てる（作業用コピーを消す）。"""
@@ -533,7 +556,7 @@ class BookViewer(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setText(f"「{Path(self._book).name}」への変更を保存しますか？")
-        box.setInformativeText("空白ページの挿入が保存されていません。保存しないと失われます。")
+        box.setInformativeText("ページの挿入・移動が保存されていません。保存しないと失われます。")
         save = box.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
         discard = box.addButton("保存しない", QMessageBox.ButtonRole.DestructiveRole)
         box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
@@ -875,7 +898,7 @@ class BookViewer(QMainWindow):
             # 未保存の挿入は古い版に対するものなので捨てる
             self._discard_work()
             self.statusBar().showMessage(
-                "元の PDF が更新されたので読み込み直しました（未保存の空白ページの挿入は取り消しました）", 8000)
+                "元の PDF が更新されたので読み込み直しました（未保存のページの挿入・移動は取り消しました）", 8000)
         else:
             self.statusBar().showMessage(f"再読み込みしました（{doc.pageCount()} ページ）", 3000)
 

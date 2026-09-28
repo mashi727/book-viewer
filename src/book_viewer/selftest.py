@@ -5,7 +5,7 @@
   2. PDF を開いて描けるか
   3. 表示したまま開き方を PDF に書き込めるか（pikepdf の同梱、Windows のファイルロック）
   4. 縦書き判定が動くか
-  5. 表示したまま空白ページを挿入できるか
+  5. 表示したまま空白ページを挿入・ページを移動し、［保存］で書き込めるか
 を確かめる。結果は終了コード（0 = 成功）と、指定したファイルへの 1 行で返す
 （--windowed のバイナリは標準出力を持たないので、ファイルに書く）。
 """
@@ -69,6 +69,14 @@ def run(result_path: str) -> int:
             assert len(chk.pages) == 4, f"after save pages={len(chk.pages)}"
         assert not win._pending and win._work is None
         steps.append(f"blank page inserted and saved [{pdfprefs.last_replace_method}]")
+
+        # ページの移動（未保存）→［保存］
+        win._move_pages([3], 0)
+        assert win._pending, "move must be pending"
+        assert win._save_current() and not win._pending
+        with pikepdf.open(pdf_path) as chk:
+            assert len(chk.pages) == 4
+        steps.append(f"page moved and saved [{pdfprefs.last_replace_method}]")
 
         win.close()
         Path(result_path).write_text("OK " + " / ".join(steps) + "\n", encoding="utf-8")

@@ -128,7 +128,7 @@ def test_apply_edits_multiple_inserts_and_layout_in_one_write(tmp_path):
     log = tmp_path / "log.jsonl"
     _pdf_with_sizes(p, [(420, 595)] * 4)
     # 2 ページ目の後に 1 枚 → その結果の先頭に 2 枚（あとの挿入は前の挿入後のページ番号で数える）
-    apply_edits(p, inserts=[(2, 1, 1), (0, 2, 0)], layout=Layout(True, True, True), log_path=log)
+    apply_edits(p, [("insert", 2, 1, 1), ("insert", 0, 2, 0)], layout=Layout(True, True, True), log_path=log)
     with pikepdf.open(p) as pdf:
         assert len(pdf.pages) == 7
         blank = [i for i, pg in enumerate(pdf.pages) if pg.obj.Contents.read_bytes() == b""]
@@ -136,3 +136,35 @@ def test_apply_edits_multiple_inserts_and_layout_in_one_write(tmp_path):
     assert read_layout(p) == Layout(True, True, True)
     lines = log.read_text().splitlines()
     assert len(lines) == 1 and json.loads(lines[0])["action"] == "edits"   # 1 回の書き込みで 1 行
+
+
+def test_move_order():
+    from book_viewer.pdfprefs import move_order
+    assert move_order(5, [3], 0) == [3, 0, 1, 2, 4]          # 後ろのページを先頭へ
+    assert move_order(5, [0], 5) == [1, 2, 3, 4, 0]          # 先頭のページを末尾へ
+    assert move_order(6, [4, 1], 3) == [0, 2, 1, 4, 3, 5]    # 離れたページをまとめて（順序は保つ）
+    assert move_order(4, [1, 2], 2) == [0, 1, 2, 3]          # 自分の位置に落としても変わらない
+
+
+def test_apply_edits_move_and_insert(tmp_path):
+    from book_viewer.pdfprefs import apply_edits
+    p = tmp_path / "a.pdf"
+    pdf = pikepdf.new()
+    for i in range(5):
+        pdf.add_blank_page(page_size=(420, 595))
+        pdf.pages[-1].obj.Contents = pdf.make_stream(f"% p{i}".encode())
+    pdf.save(p)
+    apply_edits(p, [("move", [3, 4], 1), ("insert", 0, 1, 0)])
+    with pikepdf.open(p) as pdf:
+        got = [pg.obj.Contents.read_bytes().decode() for pg in pdf.pages]
+    assert got == ["", "% p0", "% p3", "% p4", "% p1", "% p2"]
+
+
+def test_apply_edits_rejects_bad_move(tmp_path):
+    import pytest
+    from book_viewer.pdfprefs import apply_edits
+    p = tmp_path / "a.pdf"
+    _pdf_with_sizes(p, [(420, 595)] * 3)
+    with pytest.raises(ValueError):
+        apply_edits(p, [("move", [5], 0)])
+    assert not list(tmp_path.glob(".*tmp"))
