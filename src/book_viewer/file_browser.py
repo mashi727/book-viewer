@@ -15,13 +15,14 @@ QFileIconProvider から取るので Finder と同じ（ドライブの種類ご
   - 展開済みのフォルダは QFileSystemWatcher で見張り、追加・削除を反映する
   - /Volumes も見張り、ドライブの抜き差しを「この Mac」に反映する
   - 2 列目は読書の進捗（%）。PDF にマウスを乗せると表紙のサムネイルを出す
+  - 検索欄（⇧⌘F）: 起動フォルダ以下（サブフォルダも含む）の PDF をファイル名で探し、
+    フォルダごとにまとめた結果をツリーの代わりに出す。✕ / Esc でツリーに戻る（search.py）
 """
 from __future__ import annotations
 
 import hashlib
 import html
 import os
-import stat
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -29,6 +30,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QCollator,
     QEvent,
+    QKeyCombination,
     QFileInfo,
     QFileSystemWatcher,
     QObject,
@@ -48,6 +50,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
+    QStackedWidget,
     QToolButton,
     QToolTip,
     QTreeWidget,
@@ -56,6 +60,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .fsutil import is_hidden
+from .search import scan_pdfs, search
 from .state import cache_dir
 
 _THUMB_HEIGHT = 240          # ツールチップのサムネイル高さ (px)
@@ -68,17 +74,6 @@ _PLACEHOLDER = "…"                             # 未読込フォルダに ▸ 
 # macOS keeps system snapshots / helper volumes under /Volumes as well.
 _HIDDEN_VOLUME_NAMES = {"Recovery", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware"}
 _NETWORK_FS = {"smbfs", "afpfs", "nfs", "webdav", "cifs", "smb3", "fuse.sshfs"}
-
-
-def is_hidden(st: os.stat_result) -> bool:
-    """Finder / エクスプローラーと同じく隠しファイルか（名前の . 始まりは呼び出し側で見る）。
-
-    macOS は UF_HIDDEN フラグ（/bin・/usr・~/Library など）、Windows は隠し属性。
-    どちらの属性も、無い OS の stat_result には存在しない。
-    """
-    if getattr(st, "st_flags", 0) & stat.UF_HIDDEN:
-        return True
-    return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_HIDDEN)
 
 
 def mounted_volumes() -> list[tuple[str, Path]]:
@@ -152,6 +147,42 @@ class _ThumbJob(QRunnable):
                 tmp.unlink(missing_ok=True)
             self._signals.done.emit(self._path)
         doc.close()
+
+
+class _IndexSignals(QObject):
+    done = Signal(int, list)          # 世代, PDF のパス一覧
+
+
+class _IndexJob(QRunnable):
+    """起動フォルダ以下の PDF を集める（別スレッド。大きな本棚やネットワークドライブでも UI を止めない）。"""
+
+    def __init__(self, root: str, gen: int, signals: _IndexSignals):
+        super().__init__()
+        self._root, self._gen, self._signals = root, gen, signals
+
+    def run(self) -> None:
+        try:
+            paths = scan_pdfs(self._root)
+        except OSError:
+            paths = []
+        self._signals.done.emit(self._gen, paths)
+
+
+class _SearchEdit(QLineEdit):
+    """Esc で検索を消す。ウィンドウ全体の Esc（全画面の解除）より先に受け取る。"""
+
+    def event(self, event: QEvent) -> bool:
+        if (event.type() == QEvent.Type.ShortcutOverride and self.text()
+                and event.keyCombination() == QKeyCombination(Qt.Key.Key_Escape)):
+            event.accept()                 # ショートカットに渡さず keyPressEvent で受ける
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self.text():
+            self.clear()
+            return
+        super().keyPressEvent(event)
 
 
 # ---- ツリー ----
@@ -228,6 +259,31 @@ class FileBrowserPanel(QWidget):
         head.addWidget(title, 1)
         head.addWidget(close)
         outer.addLayout(head)
+
+        # 検索欄（起動フォルダ以下をファイル名で探す）
+        self.search_edit = _SearchEdit()
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        self.search_edit.returnPressed.connect(self._on_search_return)
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(6, 2, 6, 2)
+        search_row.addWidget(self.search_edit)
+        outer.addLayout(search_row)
+        self._search_status = QLabel()
+        self._search_status.setContentsMargins(8, 0, 8, 2)
+        self._search_status.hide()
+        outer.addWidget(self._search_status)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)                 # 打鍵ごとには探さない
+        self._search_timer.timeout.connect(self._run_search)
+        self._index: list[str] | None = None
+        self._index_root: str | None = None
+        self._index_gen = 0
+        self._index_signals = _IndexSignals()
+        self._index_signals.done.connect(self._on_index_ready)
+        self._index_pool = QThreadPool(self)
+        self._index_pool.setMaxThreadCount(1)
         # フラット: 枠（QGroupBox）もツリーの縁取りも無し。パネルの境目は分割線 1px だけ
         layout = outer
 
@@ -245,9 +301,26 @@ class FileBrowserPanel(QWidget):
         self.tree.itemExpanded.connect(self._ensure_loaded)
         self.tree.itemClicked.connect(self._on_clicked)
         self.tree.setFrameShape(QTreeWidget.Shape.NoFrame)
-        layout.addWidget(self.tree)
+        # 検索結果（フォルダごとにまとめた一覧）。検索中だけツリーと差し替える
+        self.results = _Tree(self._tooltip)
+        self.results.setColumnCount(2)
+        self.results.setHeaderHidden(True)
+        self.results.setUniformRowHeights(True)
+        self.results.setExpandsOnDoubleClick(False)
+        self.results.setIconSize(self.tree.iconSize())
+        rh = self.results.header()
+        rh.setStretchLastSection(False)
+        rh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        rh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.results.setFrameShape(QTreeWidget.Shape.NoFrame)
+        self.results.itemClicked.connect(self._on_clicked)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self.tree)
+        self._stack.addWidget(self.results)
+        layout.addWidget(self._stack)
 
         self._build_roots()
+        self._update_search_placeholder()
         if Path("/Volumes").is_dir():
             self._watcher.addPath("/Volumes")          # ドライブの抜き差し
 
@@ -306,11 +379,105 @@ class FileBrowserPanel(QWidget):
         self.tree.insertTopLevelItem(index, self._start_item)
         self._update_up_item()
         self.reveal(old, under=self._start_item)
+        self._update_search_placeholder()
+        self._index = None                        # 探す範囲が変わったので作り直す
+        if self.search_edit.text().strip():
+            self._run_search()
         self.start_dir_changed.emit(parent)
 
     def refresh_progress(self, path: str) -> None:
-        for item in self._items_for(path):
+        for item in self._items_for(path) + self._result_items_for(path):
             item.setText(1, self._progress_text(path))
+
+    def focus_search(self) -> None:
+        self.search_edit.setFocus()
+        self.search_edit.selectAll()
+
+    # ---- 検索 ----
+
+    def _update_search_placeholder(self) -> None:
+        name = self._start_dir.name or str(self._start_dir)
+        self.search_edit.setPlaceholderText(f"ファイル名を検索（{name} 以下）")
+        self.search_edit.setToolTip(f"{self._start_dir} 以下（サブフォルダも含む）の PDF をファイル名で探す（⇧⌘F）\n"
+                                    "空白で区切ると、すべての語を含むものに絞り込む。Esc で消す")
+
+    def _on_search_changed(self, text: str) -> None:
+        if not text.strip():
+            self._search_timer.stop()
+            self._stack.setCurrentWidget(self.tree)
+            self._search_status.hide()
+            self._index = None                    # 次の検索では最新の状態で集め直す
+            return
+        self._search_timer.start()
+
+    def _run_search(self) -> None:
+        query = self.search_edit.text()
+        if not query.strip():
+            return
+        root = str(self._start_dir)
+        if self._index is None or self._index_root != root:
+            self._index = None
+            self._index_root = root
+            self._index_gen += 1
+            self._index_pool.start(_IndexJob(root, self._index_gen, self._index_signals))
+            self._search_status.setText("検索中…")
+            self._search_status.show()
+            return
+        hits, total = search(self._index, query)
+        self._show_results(hits, total)
+
+    def _on_index_ready(self, gen: int, paths: list) -> None:
+        if gen != self._index_gen:
+            return                                # 範囲が変わった後の古い結果
+        self._index = paths
+        if self.search_edit.text().strip():
+            self._run_search()
+
+    def _show_results(self, hits: list[str], total: int) -> None:
+        self.results.clear()
+        root = self._start_dir
+        groups: dict[str, list[str]] = {}
+        for p in hits:
+            groups.setdefault(str(Path(p).parent), []).append(p)
+        key = lambda s: self._collator.sortKey(s)        # noqa: E731
+        for folder in sorted(groups, key=key):
+            rel = os.path.relpath(folder, root)
+            label = (root.name or str(root)) if rel == "." else rel
+            head = QTreeWidgetItem([label, ""])
+            head.setIcon(0, self._icons.icon(QFileInfo(folder)))
+            head.setData(0, _PATH_ROLE, folder)
+            head.setData(0, _LOADED_ROLE, True)          # 検索結果の子だけを持つ（中身を読み直さない）
+            head.setToolTip(0, folder)
+            for p in sorted(groups[folder], key=lambda s: self._collator.sortKey(Path(s).name)):
+                head.addChild(self._pdf_item(Path(p)))
+            self.results.addTopLevelItem(head)
+            head.setExpanded(True)
+        self._stack.setCurrentWidget(self.results)
+        if total == 0:
+            self._search_status.setText("見つかりません")
+        elif total > len(hits):
+            self._search_status.setText(f"{total} 件（先頭の {len(hits)} 件を表示）")
+        else:
+            self._search_status.setText(f"{total} 件")
+        self._search_status.show()
+
+    def _on_search_return(self) -> None:
+        """Enter: 1 件だけならその本を開く。複数なら結果の先頭へ移る。"""
+        pdfs = [self.results.topLevelItem(i).child(j)
+                for i in range(self.results.topLevelItemCount())
+                for j in range(self.results.topLevelItem(i).childCount())]
+        if len(pdfs) == 1:
+            self.pdf_clicked.emit(Path(pdfs[0].data(0, _PATH_ROLE)))
+        elif pdfs:
+            self.results.setFocus()
+            self.results.setCurrentItem(pdfs[0])
+
+    def _result_items_for(self, path: str) -> list[QTreeWidgetItem]:
+        out = []
+        for i in range(self.results.topLevelItemCount()):
+            head = self.results.topLevelItem(i)
+            out += [head.child(j) for j in range(head.childCount()) if head.child(j).data(0, _PATH_ROLE) == path]
+        return out
 
     def forget_thumbnail(self, path: str) -> None:
         self._requested.discard(path)

@@ -7,6 +7,8 @@
 
   ファイル:
     ⌘O 開く…（PDF）   ⇧⌘O フォルダを開く…   ⌘S 保存   ⌘W 閉じる   ⌘D 文書のプロパティ…
+  編集:
+    ⇧⌘F ファイル名を検索…（起動フォルダ以下、サブフォルダも含む。Esc で消す）
   文書:
     ⇧⌘T 空白ページを挿入…（基準ページと同じ大きさ。サムネールの右クリックからも）
   表示:
@@ -206,6 +208,8 @@ class BookViewer(QMainWindow):
                            tip="いまの表示（ページレイアウト・綴じ方）を PDF に保存")
         self._act_close = A("閉じる", QKeySequence.StandardKey.Close, self._close_book)
         self._act_props = A("文書のプロパティ…", "Ctrl+D", self._show_properties)
+        self._act_find = A("ファイル名を検索…", "Ctrl+Shift+F", self._focus_search,
+                            tip="起動フォルダ以下（サブフォルダも含む）の PDF をファイル名で探す")
         self._act_insert_blank = A("空白ページを挿入…", "Ctrl+Shift+T", self._show_insert_blank,
                                    tip="基準ページと同じ大きさの空白ページを挿入")
         # ページナビゲーション（←→ Home End はページビューが受け持つので、ここでは割り当てない。
@@ -268,6 +272,9 @@ class BookViewer(QMainWindow):
         m.addActions([self._act_save, self._act_close])
         m.addSeparator()
         m.addAction(self._act_props)
+
+        m = mb.addMenu("編集")
+        m.addAction(self._act_find)
 
         m = mb.addMenu("文書")
         m.addAction(self._act_insert_blank)
@@ -541,6 +548,11 @@ class BookViewer(QMainWindow):
         self._store.save()
         if on:
             self._thumbs.set_current_pages(self._view.current_group())
+
+    def _focus_search(self) -> None:
+        if not self._act_tree.isChecked():
+            self._set_tree_visible(True)
+        self._browser.focus_search()
 
     def _set_tree_visible(self, on: bool) -> None:
         on = bool(on)

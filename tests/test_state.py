@@ -28,7 +28,7 @@ def test_ui_prefs(tmp_path):
 def test_is_hidden_by_platform_attributes():
     import stat
     from types import SimpleNamespace
-    from book_viewer.file_browser import is_hidden
+    from book_viewer.fsutil import is_hidden
     assert is_hidden(SimpleNamespace(st_flags=stat.UF_HIDDEN)) is True                        # macOS
     assert is_hidden(SimpleNamespace(st_file_attributes=stat.FILE_ATTRIBUTE_HIDDEN)) is True  # Windows
     assert is_hidden(SimpleNamespace(st_flags=0)) is False
