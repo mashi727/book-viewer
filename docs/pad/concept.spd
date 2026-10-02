@@ -1,5 +1,5 @@
 自炊本を、紙の本の開き方で読む
-	:comment 問題：PDF の開き方が本と合わない
+	:comment 課題：PDF の開き方が本と合わない
 	:comment 方針：開き方を PDF 自身に書き込む
 	本棚を開く
 		$ book-viewer <フォルダ>
